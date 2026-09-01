@@ -30,11 +30,30 @@ void TMC2209Component::setup() {
     this->diag_isr_store_.pin_triggered_ptr = &this->diag_triggered_;
   }
 
-  if (!this->read_field(VERSION_FIELD)) {
+  //BEGIN EDITS
+  //DISABLED PER CHATGPT https://chatgpt.com/c/6a958db2-891c-83e8-bdb4-8f063b04f1f1 in favor of retry code in next section
+  // if (!this->read_field(VERSION_FIELD)) {
+  //   this->status_set_error(LOG_STR("Failed to communicate with driver"));
+  //   this->mark_failed();
+  // }
+
+  uint32_t version = 0;
+
+  for (uint8_t attempt = 0; attempt < 3 && version == 0; attempt++) {
+    version = this->read_field(VERSION_FIELD);
+  
+    if (version == 0 && attempt < 2) {
+      delay(10);
+    }
+  }
+  
+  if (!version) {
     this->status_set_error(LOG_STR("Failed to communicate with driver"));
     this->mark_failed();
   }
+  // END EDITS
 
+  
   this->write_field(PDN_DISABLE_FIELD, true);
   this->write_field(TEST_MODE_FIELD, false);
   this->write_field(SHAFT_FIELD, false);
