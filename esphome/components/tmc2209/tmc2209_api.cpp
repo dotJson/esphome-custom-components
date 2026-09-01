@@ -65,29 +65,100 @@ bool TMC2209API::cache_(CacheOperation operation, uint8_t address, uint32_t *val
   return false;
 }
 
+// void TMC2209API::write_register(uint8_t address, int32_t value) {
+//   ESP_LOGVV(TAG, "writing address 0x%x with value 0x%x (%d)", address, value, value);
+
+//   std::array<uint8_t, 8> buffer = {0};
+
+//   buffer.at(0) = 0x05;
+//   buffer.at(1) = this->address_;
+//   buffer.at(2) = address | WRITE_BIT;
+//   buffer.at(3) = (value >> 24) & 0xFF;
+//   buffer.at(4) = (value >> 16) & 0xFF;
+//   buffer.at(5) = (value >> 8) & 0xFF;
+//   buffer.at(6) = (value) &0xFF;
+//   buffer.at(7) = this->crc8_(buffer.data(), 7);
+
+//   // TODO: maybe do something with IFCNT for write verification
+//   this->parent_->write_array(buffer.data(), 8);
+//   this->parent_->read_array(buffer.data(), 8);  // transmitting on one-wire fills up receiver
+//   this->parent_->flush();
+
+//   this->cache_(CACHE_WRITE, address, (uint32_t *) &value);
+// }
+
+//BEGIN EDIT per chatgpt here to retry some chip reading / writing
 void TMC2209API::write_register(uint8_t address, int32_t value) {
-  ESP_LOGVV(TAG, "writing address 0x%x with value 0x%x (%d)", address, value, value);
+  ESP_LOGVV(TAG, "writing address 0x%x with value 0x%x (%d)",
+            address, value, value);
 
-  std::array<uint8_t, 8> buffer = {0};
+  address = address & ADDRESS_MASK;
 
-  buffer.at(0) = 0x05;
-  buffer.at(1) = this->address_;
-  buffer.at(2) = address | WRITE_BIT;
-  buffer.at(3) = (value >> 24) & 0xFF;
-  buffer.at(4) = (value >> 16) & 0xFF;
-  buffer.at(5) = (value >> 8) & 0xFF;
-  buffer.at(6) = (value) &0xFF;
-  buffer.at(7) = this->crc8_(buffer.data(), 7);
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    // IFCNT increments once for every successful UART write.
+    uint8_t ifcnt_before =
+        static_cast<uint8_t>(this->read_register(IFCNT) & 0xFF);
 
-  // TODO: maybe do something with IFCNT for write verification
-  this->parent_->write_array(buffer.data(), 8);
-  this->parent_->read_array(buffer.data(), 8);  // transmitting on one-wire fills up receiver
-  this->parent_->flush();
+    std::array<uint8_t, 8> buffer = {0};
 
-  this->cache_(CACHE_WRITE, address, (uint32_t *) &value);
+    buffer.at(0) = 0x05;
+    buffer.at(1) = this->address_;
+    buffer.at(2) = address | WRITE_BIT;
+    buffer.at(3) = (value >> 24) & 0xFF;
+    buffer.at(4) = (value >> 16) & 0xFF;
+    buffer.at(5) = (value >> 8) & 0xFF;
+    buffer.at(6) = value & 0xFF;
+    buffer.at(7) = this->crc8_(buffer.data(), 7);
+
+    // Remove anything stale before transmitting.
+    while (this->parent_->available()) {
+      uint8_t discard;
+      this->parent_->read_byte(&discard);
+    }
+
+    // Send exactly one write transaction.
+    this->parent_->write_array(buffer.data(), 8);
+
+    // At 115200 baud the 8-byte echo takes less than 1 ms.
+    // Allow it to arrive, then discard whatever was echoed.
+    delay(1);
+
+    while (this->parent_->available()) {
+      uint8_t discard;
+      this->parent_->read_byte(&discard);
+    }
+
+    this->parent_->flush();
+
+    uint8_t ifcnt_after =
+        static_cast<uint8_t>(this->read_register(IFCNT) & 0xFF);
+
+    if (ifcnt_after == static_cast<uint8_t>(ifcnt_before + 1)) {
+      // Only update our shadow copy after the chip confirmed the write.
+      uint32_t cached_value = static_cast<uint32_t>(value);
+      this->cache_(CACHE_WRITE, address, &cached_value);
+
+      ESP_LOGD(TAG,
+               "Write 0x%02X confirmed by IFCNT (%u -> %u)",
+               address, ifcnt_before, ifcnt_after);
+      return;
+    }
+
+    ESP_LOGW(TAG,
+             "Write 0x%02X attempt %u not confirmed "
+             "(IFCNT %u -> %u)",
+             address,
+             attempt + 1,
+             ifcnt_before,
+             ifcnt_after);
+
+    delay(2);
+  }
+
+  ESP_LOGE(TAG, "Write 0x%02X failed after 3 attempts", address);
 }
 
-//BEGIN EDIT per chatgpt here to retry some chip reading 
+
 // int32_t TMC2209API::read_register(uint8_t address) {
 //   ESP_LOGVV(TAG, "reading address 0x%x", address);
 //   uint32_t value;
@@ -130,7 +201,15 @@ void TMC2209API::write_register(uint8_t address, int32_t value) {
 // }
 
 int32_t TMC2209API::read_register(uint8_t address) {
-  //ESP_LOGI(TAG, "dotJson TMC2209 UART retry patch active in https://github.com/dotJson/esphome-custom-components/blob/master/esphome/components/tmc2209/tmc2209_api.cpp::132");
+  ESP_LOGVV(TAG, "reading address 0x%x", address);
+  uint32_t value;
+
+  // Read from cache for registers with write-only access.
+  if (this->cache_(CACHE_READ, address, &value))
+    return value;
+
+  address = address & ADDRESS_MASK;
+
   for (uint8_t attempt = 0; attempt < 3; attempt++) {
     std::array<uint8_t, 8> buffer = {0};
 
@@ -139,19 +218,19 @@ int32_t TMC2209API::read_register(uint8_t address) {
     buffer.at(2) = address;
     buffer.at(3) = this->crc8_(buffer.data(), 3);
 
-    // Clear anything left in RX before starting a new transaction.
+    // Clear stale RX data before starting a new transaction.
     while (this->parent_->available()) {
       uint8_t discard;
       this->parent_->read_byte(&discard);
     }
 
-    // Send 4-byte read request.
+    // Send the 4-byte read request.
     this->parent_->write_array(buffer.data(), 4);
 
-    // On the one-wire UART bus our transmitted request appears in RX.
-    // Consume that 4-byte echo before waiting for the TMC2209 response.
+    // One-wire UART echoes our transmitted request into RX.
     if (!this->parent_->read_array(buffer.data(), 4)) {
-      ESP_LOGW(TAG, "Read 0x%02X attempt %u: missing TX echo", address, attempt + 1);
+      ESP_LOGW(TAG, "Read 0x%02X attempt %u: missing TX echo",
+               address, attempt + 1);
       delay(2);
       continue;
     }
@@ -160,12 +239,12 @@ int32_t TMC2209API::read_register(uint8_t address) {
 
     // Read the 8-byte TMC2209 response.
     if (!this->parent_->read_array(buffer.data(), 8)) {
-      ESP_LOGW(TAG, "Read 0x%02X attempt %u: response timeout", address, attempt + 1);
+      ESP_LOGW(TAG, "Read 0x%02X attempt %u: response timeout",
+               address, attempt + 1);
       delay(2);
       continue;
     }
 
-    // Validate sync byte.
     if (buffer.at(0) != 0x05) {
       ESP_LOGW(TAG, "Read 0x%02X attempt %u: bad sync 0x%02X",
                address, attempt + 1, buffer.at(0));
@@ -173,7 +252,6 @@ int32_t TMC2209API::read_register(uint8_t address) {
       continue;
     }
 
-    // TMC2209 response master address must be 0xFF.
     if (buffer.at(1) != 0xFF) {
       ESP_LOGW(TAG, "Read 0x%02X attempt %u: bad master 0x%02X",
                address, attempt + 1, buffer.at(1));
@@ -181,7 +259,6 @@ int32_t TMC2209API::read_register(uint8_t address) {
       continue;
     }
 
-    // Make sure this is the register we requested.
     if (buffer.at(2) != address) {
       ESP_LOGW(TAG, "Read 0x%02X attempt %u: wrong register 0x%02X",
                address, attempt + 1, buffer.at(2));
@@ -189,7 +266,6 @@ int32_t TMC2209API::read_register(uint8_t address) {
       continue;
     }
 
-    // Validate CRC.
     if (buffer.at(7) != this->crc8_(buffer.data(), 7)) {
       ESP_LOGW(TAG, "Read 0x%02X attempt %u: CRC error",
                address, attempt + 1);
@@ -197,10 +273,11 @@ int32_t TMC2209API::read_register(uint8_t address) {
       continue;
     }
 
-    return (static_cast<int32_t>(buffer.at(3)) << 24) |
-           (static_cast<int32_t>(buffer.at(4)) << 16) |
-           (static_cast<int32_t>(buffer.at(5)) << 8) |
-           static_cast<int32_t>(buffer.at(6));
+    return encode_uint32(
+        buffer.at(3),
+        buffer.at(4),
+        buffer.at(5),
+        buffer.at(6));
   }
 
   ESP_LOGE(TAG, "Read 0x%02X failed after 3 attempts", address);
