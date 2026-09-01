@@ -130,6 +130,7 @@ void TMC2209API::write_register(uint8_t address, int32_t value) {
 // }
 
 int32_t TMC2209API::read_register(uint8_t address) {
+  ESP_LOGI(TAG, "dotJson TMC2209 UART retry patch active in https://github.com/dotJson/esphome-custom-components/blob/master/esphome/components/tmc2209/tmc2209_api.cpp::132");
   for (uint8_t attempt = 0; attempt < 3; attempt++) {
     std::array<uint8_t, 8> buffer = {0};
 
