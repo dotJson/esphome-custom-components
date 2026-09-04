@@ -90,8 +90,8 @@ static const int32_t sample_register_preset[REGISTER_COUNT] = {
 
 class TMC2209API : public Parented<TMC2209Hub> {
  public:
-  TMC2209API() = default;
-  TMC2209API(uint8_t address) : address_(address){};
+  TMC2209API() { this->initialize_cache_(); }
+  TMC2209API(uint8_t address) : address_(address) { this->initialize_cache_(); }
 
   void set_address(uint8_t address) { this->address_ = address; }
 
@@ -116,6 +116,7 @@ class TMC2209API : public Parented<TMC2209Hub> {
   bool get_dirty_bit_(uint8_t index);
   bool cache_(CacheOperation operation, uint8_t address, uint32_t *value);
   uint8_t crc8_(uint8_t *data, uint32_t bytes);
+  void initialize_cache_();
 
   // Internal read helper that preserves success/failure information.
   // This is required for safety-critical IFCNT write verification.
