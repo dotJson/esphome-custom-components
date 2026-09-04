@@ -98,9 +98,9 @@ class TMC2209API : public Parented<TMC2209Hub> {
   uint8_t get_address() { return this->address_; }
 
   // Write or read a register (all fields) or register field (single field within register)
-  void write_register(uint8_t address, int32_t value);
+  bool write_register(uint8_t address, int32_t value);
   int32_t read_register(uint8_t address);
-  void write_field(RegisterField field, uint32_t value);
+  bool write_field(RegisterField field, uint32_t value);
   uint32_t read_field(RegisterField field);
   uint32_t extract_field(uint32_t data, RegisterField field);
   uint32_t update_field(uint32_t data, RegisterField field, uint32_t value);
@@ -116,6 +116,10 @@ class TMC2209API : public Parented<TMC2209Hub> {
   bool get_dirty_bit_(uint8_t index);
   bool cache_(CacheOperation operation, uint8_t address, uint32_t *value);
   uint8_t crc8_(uint8_t *data, uint32_t bytes);
+
+  // Internal read helper that preserves success/failure information.
+  // This is required for safety-critical IFCNT write verification.
+  bool read_register_verified_(uint8_t address, int32_t *value);
 };
 
 }  // namespace tmc2209
