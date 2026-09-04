@@ -206,8 +206,6 @@ void TMC2209Stepper::setup() {
   }
   //END EDIT
 
-  this->enable(true);
-
   ESP_LOGCONFIG(
       TAG,
       "TMC2209 Stepper setup done.");
@@ -248,6 +246,27 @@ void TMC2209Stepper::loop() {
    */
   if (this->control_method_ ==
       ControlMethod::SERIAL_CONTROL) {
+
+    /*
+     * Do not let the TMC2209 internal velocity generator run until
+     * set_target() has explicitly established a target.
+     */
+    if (!this->target_initialized_) {
+      if (this->vactual_ != 0) {
+        if (this->write_field(VACTUAL_FIELD, 0)) {
+          this->vactual_ = 0;
+        } else {
+          this->vactual_ = 1;
+          ESP_LOGE(
+              TAG,
+              "FAILED TO CONFIRM VACTUAL=0 BEFORE TARGET INITIALIZATION");
+        }
+      }
+
+      this->current_direction =
+          Direction::STANDSTILL;
+      return;
+    }
 
     int32_t requested_vactual = 0;
 
@@ -546,6 +565,7 @@ void TMC2209Stepper::set_target(
     this->enable(true);
   }
 
+  this->target_initialized_ = true;
   Stepper::set_target(steps);
 }
 //END EDITS
