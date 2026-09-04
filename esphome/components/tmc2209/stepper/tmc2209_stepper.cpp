@@ -48,21 +48,150 @@ void TMC2209Stepper::setup() {
         DEDGE_FIELD, true);
   }
 
-  if (this->control_method_ ==
+  //BEGIN EDITS
+  // if (this->control_method_ ==
+  //     ControlMethod::SERIAL_CONTROL) {
+
+  //   /*
+  //    * Configure INDEX for pulse feedback from the driver.
+  //    * See figure 15.1 in TMC2209 datasheet rev 1.09.
+  //    */
+  //   this->write_field(
+  //       DEDGE_FIELD, false);
+
+  //   this->write_field(
+  //       INDEX_OTPW_FIELD, false);
+
+  //   this->write_field(
+  //       INDEX_STEP_FIELD, true);
+
+  //   this->ips_.current_position_ptr =
+  //       &this->current_position;
+
+  //   this->ips_.direction_ptr =
+  //       &this->current_direction;
+
+  //   this->index_pin_->attach_interrupt(
+  //       IndexPulseStore::pulse_isr,
+  //       &this->ips_,
+  //       gpio::INTERRUPT_ANY_EDGE);
+  // }
+
+    if (this->control_method_ ==
       ControlMethod::SERIAL_CONTROL) {
 
     /*
-     * Configure INDEX for pulse feedback from the driver.
-     * See figure 15.1 in TMC2209 datasheet rev 1.09.
+     * SERIAL_CONTROL requires:
+     *
+     *   INDEX_OTPW       = 0  -> INDEX is not OTPW
+     *   INDEX_STEP       = 1  -> INDEX toggles for every internal step
+     *   MSTEP_REG_SELECT = 1  -> MRES register controls microstepping
+     *
+     * Do not rely on several independent GCONF read/modify/write
+     * operations here. Build the required final GCONF value and
+     * verify that the driver actually retained it.
      */
+
     this->write_field(
         DEDGE_FIELD, false);
 
-    this->write_field(
-        INDEX_OTPW_FIELD, false);
+    bool gconf_ok = false;
 
-    this->write_field(
-        INDEX_STEP_FIELD, true);
+    for (uint8_t attempt = 1;
+         attempt <= 5;
+         attempt++) {
+
+      int32_t current_gconf =
+          this->read_register(GCONF);
+
+      /*
+       * GCONF:
+       * bit 4 INDEX_OTPW       -> clear
+       * bit 5 INDEX_STEP       -> set
+       * bit 7 MSTEP_REG_SELECT -> set
+       *
+       * Preserve every unrelated GCONF bit.
+       */
+      int32_t desired_gconf =
+          current_gconf;
+
+      desired_gconf &=
+          ~(static_cast<int32_t>(1UL << 4));
+
+      desired_gconf |=
+          static_cast<int32_t>(1UL << 5);
+
+      desired_gconf |=
+          static_cast<int32_t>(1UL << 7);
+
+      ESP_LOGI(
+          TAG,
+          "SERIAL GCONF attempt %u: current=0x%08X desired=0x%08X",
+          attempt,
+          static_cast<uint32_t>(current_gconf),
+          static_cast<uint32_t>(desired_gconf));
+
+      const bool write_ok =
+          this->write_register(
+              GCONF,
+              desired_gconf);
+
+      if (!write_ok) {
+        ESP_LOGW(
+            TAG,
+            "SERIAL GCONF attempt %u write was not confirmed",
+            attempt);
+
+        continue;
+      }
+
+      const int32_t verified_gconf =
+          this->read_register(GCONF);
+
+      const bool index_step_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 5)) != 0;
+
+      const bool index_otpw_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 4)) == 0;
+
+      const bool mstep_reg_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 7)) != 0;
+
+      ESP_LOGI(
+          TAG,
+          "SERIAL GCONF verify: 0x%08X "
+          "INDEX_STEP=%u INDEX_OTPW=%u MSTEP_REG_SELECT=%u",
+          static_cast<uint32_t>(verified_gconf),
+          index_step_ok,
+          !index_otpw_ok,
+          mstep_reg_ok);
+
+      if (index_step_ok &&
+          index_otpw_ok &&
+          mstep_reg_ok) {
+
+        gconf_ok = true;
+        break;
+      }
+
+      ESP_LOGW(
+          TAG,
+          "SERIAL GCONF verification failed on attempt %u",
+          attempt);
+    }
+
+    if (!gconf_ok) {
+      ESP_LOGE(
+          TAG,
+          "FAILED TO CONFIGURE SERIAL INDEX FEEDBACK");
+    } else {
+      ESP_LOGI(
+          TAG,
+          "SERIAL INDEX FEEDBACK CONFIGURED");
+    }
 
     this->ips_.current_position_ptr =
         &this->current_position;
@@ -75,6 +204,7 @@ void TMC2209Stepper::setup() {
         &this->ips_,
         gpio::INTERRUPT_ANY_EDGE);
   }
+  //END EDIT
 
   this->enable(true);
 
