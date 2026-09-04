@@ -271,15 +271,30 @@ bool TMC2209Component::is_stalled() {
 }
 
 uint16_t TMC2209Component::get_microsteps() { return MRES_TO_MS(this->read_field(MRES_FIELD)); }
+
+
+// BEGIN EDITS
+// void TMC2209Component::set_microsteps(uint16_t ms) {
+//   for (uint8_t mres = 0; mres <= 8; mres++) {
+//     if (MRES_TO_MS(mres) == ms) {
+//       return this->write_field(MRES_FIELD, mres);
+//     }
+//   }
+
+//   ESP_LOGW(TAG, "%d is not a valid microstepping option", ms);
+// }
+
 void TMC2209Component::set_microsteps(uint16_t ms) {
   for (uint8_t mres = 0; mres <= 8; mres++) {
     if (MRES_TO_MS(mres) == ms) {
-      return this->write_field(MRES_FIELD, mres);
+      this->write_field(MRES_FIELD, mres);
+      return;
     }
   }
 
   ESP_LOGW(TAG, "%d is not a valid microstepping option", ms);
 }
+//END EDITS
 
 float TMC2209Component::get_motor_load() {
   const int32_t result = this->read_register(SG_RESULT);
