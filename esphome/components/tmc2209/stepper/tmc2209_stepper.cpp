@@ -399,6 +399,27 @@ void TMC2209Stepper::loop() {
   }
 }
 
+//BEGIN EDITS
+// void TMC2209Stepper::set_target(
+//     int32_t steps) {
+
+//   if (this->control_method_ ==
+//       ControlMethod::CONTROL_UNSET) {
+
+//     ESP_LOGE(
+//         TAG,
+//         "Control method not set!");
+
+//     return;
+//   }
+
+//   if (!this->is_enabled_) {
+//     this->enable(true);
+//   }
+
+//   Stepper::set_target(steps);
+// }
+
 void TMC2209Stepper::set_target(
     int32_t steps) {
 
@@ -412,12 +433,122 @@ void TMC2209Stepper::set_target(
     return;
   }
 
+  /*
+   * SERIAL_CONTROL absolutely depends on INDEX providing
+   * internal step feedback.
+   *
+   * Verify and repair GCONF immediately before accepting
+   * a movement command. This prevents a later configuration
+   * write or driver reset from silently disabling INDEX_STEP.
+   */
+  if (this->control_method_ ==
+      ControlMethod::SERIAL_CONTROL) {
+
+    bool gconf_ok = false;
+
+    for (uint8_t attempt = 1;
+         attempt <= 5;
+         attempt++) {
+
+      const int32_t current_gconf =
+          this->read_register(GCONF);
+
+      int32_t desired_gconf =
+          current_gconf;
+
+      // INDEX_OTPW = 0
+      desired_gconf &=
+          ~(static_cast<int32_t>(1UL << 4));
+
+      // INDEX_STEP = 1
+      desired_gconf |=
+          static_cast<int32_t>(1UL << 5);
+
+      // MSTEP_REG_SELECT = 1
+      desired_gconf |=
+          static_cast<int32_t>(1UL << 7);
+
+      if (desired_gconf != current_gconf) {
+
+        ESP_LOGW(
+            TAG,
+            "Repairing SERIAL GCONF before move: "
+            "0x%08X -> 0x%08X",
+            static_cast<uint32_t>(current_gconf),
+            static_cast<uint32_t>(desired_gconf));
+
+        if (!this->write_register(
+                GCONF,
+                desired_gconf)) {
+
+          ESP_LOGW(
+              TAG,
+              "SERIAL GCONF repair attempt %u "
+              "was not confirmed",
+              attempt);
+
+          continue;
+        }
+      }
+
+      const int32_t verified_gconf =
+          this->read_register(GCONF);
+
+      const bool index_step_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 5)) != 0;
+
+      const bool index_otpw_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 4)) == 0;
+
+      const bool mstep_reg_ok =
+          (verified_gconf &
+           static_cast<int32_t>(1UL << 7)) != 0;
+
+      if (index_step_ok &&
+          index_otpw_ok &&
+          mstep_reg_ok) {
+
+        gconf_ok = true;
+
+        ESP_LOGI(
+            TAG,
+            "SERIAL GCONF ready for move: "
+            "0x%08X",
+            static_cast<uint32_t>(verified_gconf));
+
+        break;
+      }
+    }
+
+    if (!gconf_ok) {
+
+      ESP_LOGE(
+          TAG,
+          "MOVE REJECTED - SERIAL INDEX "
+          "CONFIGURATION COULD NOT BE VERIFIED");
+
+      /*
+       * Safety: do not allow VACTUAL motion if INDEX
+       * feedback cannot be guaranteed.
+       */
+      this->write_field(
+          VACTUAL_FIELD, 0);
+
+      this->vactual_ = 0;
+
+      return;
+    }
+  }
+
   if (!this->is_enabled_) {
     this->enable(true);
   }
 
   Stepper::set_target(steps);
 }
+//END EDITS
 
 void TMC2209Stepper::stop() {
   Stepper::stop();
