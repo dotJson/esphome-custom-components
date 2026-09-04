@@ -63,19 +63,53 @@ void TMC2209Stepper::loop() {
     }
   }
 
+  //BEGIN EDIT for step limitations stuck at 350-ish per https://chatgpt.com/c/6a958db2-891c-83e8-bdb4-8f063b04f1f1
+  // if (this->control_method_ == ControlMethod::PULSES_CONTROL) {
+  //   time_t dt = now - this->last_step_;
+  //   if (dt >= (1 / (float) vactual_) * 1e6f) {
+  //     if (this->direction_ != this->current_direction) {
+  //       this->dir_pin_->digital_write(this->current_direction == Direction::BACKWARD);
+  //       this->direction_ = this->current_direction;
+  //     }
+  //     this->step_pin_->digital_write(this->step_state_);
+  //     this->step_state_ = !this->step_state_;
+  //     this->current_position += (int32_t) this->current_direction;
+  //     this->last_step_ = now;
+  //   }
+  // }
+
   if (this->control_method_ == ControlMethod::PULSES_CONTROL) {
-    time_t dt = now - this->last_step_;
-    if (dt >= (1 / (float) vactual_) * 1e6f) {
+
+  if (vactual_ > 0 && this->current_direction != Direction::STANDSTILL) {
+
+    const uint32_t step_interval_us =
+        static_cast<uint32_t>((1.0f / static_cast<float>(vactual_)) * 1000000.0f);
+
+    uint8_t catchup_steps = 0;
+
+    while ((uint32_t) (now - this->last_step_) >= step_interval_us &&
+           this->current_position != this->target_position &&
+           catchup_steps < 4) {
+
       if (this->direction_ != this->current_direction) {
-        this->dir_pin_->digital_write(this->current_direction == Direction::BACKWARD);
+        this->dir_pin_->digital_write(
+            this->current_direction == Direction::BACKWARD);
         this->direction_ = this->current_direction;
       }
+
       this->step_pin_->digital_write(this->step_state_);
       this->step_state_ = !this->step_state_;
-      this->current_position += (int32_t) this->current_direction;
-      this->last_step_ = now;
+
+      this->current_position +=
+          static_cast<int32_t>(this->current_direction);
+
+      // Advance by the intended period rather than resetting to "now".
+      this->last_step_ += step_interval_us;
+
+      catchup_steps++;
     }
   }
+}
 }
 
 void TMC2209Stepper::set_target(int32_t steps) {
