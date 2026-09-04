@@ -5,21 +5,6 @@
 namespace esphome {
 namespace tmc2209 {
 
-
-void TMC2209API::initialize_cache_() {
-  // The TMC2209 has several write-only registers. read-modify-write operations
-  // on those registers must start from a deterministic shadow copy, never from
-  // uninitialized RAM. Seed the cache with the datasheet/reset defaults used by
-  // this component.
-  for (uint8_t i = 0; i < REGISTER_COUNT; i++) {
-    this->shadow_register_[i] = sample_register_preset[i];
-  }
-
-  for (size_t i = 0; i < sizeof(this->dirty_bits_); i++) {
-    this->dirty_bits_[i] = 0;
-  }
-}
-
 uint8_t TMC2209API::crc8_(uint8_t *data, uint32_t bytes) {
   uint8_t result = 0;
   uint8_t *table;
@@ -277,44 +262,21 @@ uint32_t TMC2209API::update_field(uint32_t data, RegisterField field, uint32_t v
 }
 
 bool TMC2209API::write_field(RegisterField field, uint32_t value) {
-  // A field write is a complete read-modify-write transaction. The ESP8266
-  // UART link can occasionally lose either the register read or the IFCNT
-  // confirmation used by write_register(). Callers such as setup(),
-  // set_microsteps(), current configuration, and INDEX configuration are
-  // generally one-shot operations, so retry the ENTIRE transaction here.
-  // This prevents a single transient UART miss from silently leaving a
-  // critical TMC2209 field at its reset/default value.
-  for (uint8_t attempt = 0; attempt < 5; attempt++) {
-    int32_t raw_register = 0;
+  int32_t raw_register = 0;
 
-    // Never construct a read-modify-write from a bogus zero when the source
-    // register could not be obtained. For write-only registers this reads the
-    // deterministic shadow cache initialized from TMC2209 reset defaults.
-    if (!this->read_register_verified_(field.address, &raw_register)) {
-      ESP_LOGW(TAG,
-               "Write field 0x%02X transaction attempt %u: unable to obtain register value",
-               field.address, attempt + 1);
-      delay(2);
-      continue;
-    }
-
-    uint32_t reg_value = static_cast<uint32_t>(raw_register);
-    reg_value = this->update_field(reg_value, field, value);
-
-    if (this->write_register(field.address, static_cast<int32_t>(reg_value))) {
-      return true;
-    }
-
-    ESP_LOGW(TAG,
-             "Write field 0x%02X transaction attempt %u not confirmed",
-             field.address, attempt + 1);
-    delay(2);
+  // Preserve read failure information. Never build a write from a bogus
+  // zero value when a readable register could not be retrieved.
+  if (!this->read_register_verified_(field.address, &raw_register)) {
+    ESP_LOGE(TAG,
+             "Write field 0x%02X failed: unable to obtain register value",
+             field.address);
+    return false;
   }
 
-  ESP_LOGE(TAG,
-           "Write field 0x%02X failed after 5 complete transactions",
-           field.address);
-  return false;
+  uint32_t reg_value = static_cast<uint32_t>(raw_register);
+  reg_value = this->update_field(reg_value, field, value);
+
+  return this->write_register(field.address, static_cast<int32_t>(reg_value));
 }
 
 uint32_t TMC2209API::extract_field(uint32_t data, RegisterField field) {
