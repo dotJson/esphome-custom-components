@@ -206,6 +206,7 @@ def validate_tmc2209_base(config):
             cv.Optional(CONF_RESTORE_TOFF, default=True): cv.boolean,
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_enable_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -224,6 +225,7 @@ async def tmc2209_enable_to_code(config, action_id, template_arg, args):
             cv.Optional(CONF_RESTORE_TOFF, default=True): cv.boolean,
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_disable_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -253,6 +255,7 @@ async def tmc2209_disable_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_configure_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -310,6 +313,7 @@ async def tmc2209_configure_to_code(config, action_id, template_arg, args):
             cv.Optional(CONF_TPOWERDOWN): cv.templatable(cv.int_range(0, 255)),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_currents_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -357,6 +361,7 @@ async def tmc2209_currents_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_stallguard_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -392,6 +397,7 @@ async def tmc2209_stallguard_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_coolconf_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -437,6 +443,7 @@ async def tmc2209_coolconf_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_chopconf_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -482,6 +489,7 @@ async def tmc2209_chopconf_to_code(config, action_id, template_arg, args):
             cv.Optional(CONF_PWM_AUTOSCALE): cv.templatable(cv.boolean),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_pwmconf_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
@@ -529,6 +537,7 @@ async def tmc2209_pwmconf_to_code(config, action_id, template_arg, args):
             ),
         }
     ),
+    synchronous=True,
 )
 async def tmc2209_sync_to_code(config, action_id, template_arg, args):
 
