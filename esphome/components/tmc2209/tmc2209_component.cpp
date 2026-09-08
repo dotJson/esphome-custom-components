@@ -319,7 +319,7 @@ uint8_t TMC2209Component::rms_current_to_current_scale_mA(uint16_t mA) {
   if (mA == 0) {
     return 0;
   }
-  const uint8_t cs = this->rms_current_to_rms_current_mA_no_clamp(mA);
+  const uint8_t cs = this->rms_current_to_current_scale_mA_no_clamp(mA);
 
   if (cs > 31) {
     const uint16_t mA_limit = this->current_scale_to_rms_current_mA(cs);
