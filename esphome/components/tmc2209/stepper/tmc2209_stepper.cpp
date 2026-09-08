@@ -10,6 +10,15 @@ namespace tmc2209 {
 void TMC2209Stepper::dump_config() {
   ESP_LOGCONFIG(TAG, "TMC2209 Stepper:");
   LOG_STEPPER(this);
+
+  // LOG_TMC2209() performs live UART register reads. Once the startup
+  // probe has already marked the driver failed, the device is absent or
+  // unavailable and the config dump must not touch the UART again.
+  if (this->is_failed()) {
+    ESP_LOGE(TAG, "TMC2209 unavailable - skipping driver config/register dump");
+    return;
+  }
+
   LOG_TMC2209(this);
 }
 
