@@ -107,6 +107,14 @@ void TMC2209Stepper::on_shutdown() {
 }
 
 void TMC2209Stepper::loop() {
+  // Once setup has marked the driver failed, this component must become
+  // completely inert for the rest of the boot. In particular, do not call
+  // the base loop because it may perform UART health/status transactions.
+  if (this->is_failed()) {
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
+
   TMC2209Component::loop();
 
   const time_t now = micros();
@@ -182,6 +190,15 @@ void TMC2209Stepper::loop() {
 }
 
 void TMC2209Stepper::set_target(int32_t steps) {
+  // set_target() can be called by ESPHome/YAML during startup even after this
+  // component has been marked failed. Reject it before ANY register access.
+  if (this->is_failed()) {
+    this->current_direction = Direction::STANDSTILL;
+    this->target_position = this->current_position;
+    ESP_LOGW(TAG, "Ignoring target command because TMC2209 is unavailable");
+    return;
+  }
+
   if (this->control_method_ == ControlMethod::CONTROL_UNSET) {
     ESP_LOGE(TAG, "Control method not set!");
     return;
@@ -247,6 +264,14 @@ void TMC2209Stepper::set_target(int32_t steps) {
 void TMC2209Stepper::stop() {
   Stepper::stop();
 
+  // A failed/absent driver cannot be stopped over UART. Keep software state
+  // stopped and return without touching the bus.
+  if (this->is_failed()) {
+    this->vactual_ = 0;
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
+
   if (this->control_method_ == ControlMethod::SERIAL_CONTROL) {
     const bool confirmed = this->write_field(VACTUAL_FIELD, 0);
     if (confirmed) {
@@ -259,6 +284,13 @@ void TMC2209Stepper::stop() {
 }
 
 void TMC2209Stepper::enable(bool enable) {
+  // Do not let output/config actions revive UART traffic after startup failure.
+  if (this->is_failed()) {
+    this->is_enabled_ = false;
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
+
   if (!enable) {
     this->stop();
   }
@@ -266,6 +298,10 @@ void TMC2209Stepper::enable(bool enable) {
 }
 
 bool TMC2209Stepper::is_stalled() {
+  if (this->is_failed()) {
+    return false;
+  }
+
   if (this->current_direction == Direction::STANDSTILL) {
     return false;
   }
