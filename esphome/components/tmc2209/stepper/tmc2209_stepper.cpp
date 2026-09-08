@@ -126,10 +126,10 @@ void TMC2209Stepper::setup() {
 
       ESP_LOGI(
           TAG,
-          "SERIAL GCONF attempt %u: current=0x%08X desired=0x%08X",
+          "SERIAL GCONF attempt %u: current=0x%08lX desired=0x%08lX",
           attempt,
-          static_cast<uint32_t>(current_gconf),
-          static_cast<uint32_t>(desired_gconf));
+          static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
+          static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
 
       const bool write_ok =
           this->write_register(
@@ -162,9 +162,9 @@ void TMC2209Stepper::setup() {
 
       ESP_LOGI(
           TAG,
-          "SERIAL GCONF verify: 0x%08X "
+          "SERIAL GCONF verify: 0x%08lX "
           "INDEX_STEP=%u INDEX_OTPW=%u MSTEP_REG_SELECT=%u",
-          static_cast<uint32_t>(verified_gconf),
+          static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)),
           index_step_ok,
           !index_otpw_ok,
           mstep_reg_ok);
@@ -299,8 +299,8 @@ void TMC2209Stepper::loop() {
       } else {
         ESP_LOGE(
             TAG,
-            "VACTUAL write failed: requested=%d",
-            requested_vactual);
+            "VACTUAL write failed: requested=%ld",
+            static_cast<long>(requested_vactual));
 
         // Most important case: target reached, but the motor-stop write
         // did not make it to the TMC2209. Do NOT cache a false zero.
@@ -492,9 +492,9 @@ void TMC2209Stepper::set_target(
         ESP_LOGW(
             TAG,
             "Repairing SERIAL GCONF before move: "
-            "0x%08X -> 0x%08X",
-            static_cast<uint32_t>(current_gconf),
-            static_cast<uint32_t>(desired_gconf));
+            "0x%08lX -> 0x%08lX",
+            static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
+            static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
 
         if (!this->write_register(
                 GCONF,
@@ -534,8 +534,8 @@ void TMC2209Stepper::set_target(
         ESP_LOGI(
             TAG,
             "SERIAL GCONF ready for move: "
-            "0x%08X",
-            static_cast<uint32_t>(verified_gconf));
+            "0x%08lX",
+            static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)));
 
         break;
       }
