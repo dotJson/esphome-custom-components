@@ -50,6 +50,7 @@ void TMC2209Component::setup() {
   if (!version) {
     this->status_set_error(LOG_STR("Failed to communicate with driver"));
     this->mark_failed();
+    return;
   }
   // END EDITS
 

@@ -10,6 +10,15 @@ namespace tmc2209 {
 void TMC2209Stepper::dump_config() {
   ESP_LOGCONFIG(TAG, "TMC2209 Stepper:");
   LOG_STEPPER(this);
+
+  // LOG_TMC2209() performs live UART register reads. Once the startup
+  // probe has already marked the driver failed, the device is absent or
+  // unavailable and the config dump must not touch the UART again.
+  if (this->is_failed()) {
+    ESP_LOGE(TAG, "TMC2209 unavailable - skipping driver config/register dump");
+    return;
+  }
+
   LOG_TMC2209(this);
 }
 
@@ -17,6 +26,14 @@ void TMC2209Stepper::setup() {
   ESP_LOGCONFIG(TAG, "Setting up TMC2209 Stepper...");
 
   TMC2209Component::setup();
+
+  // The base component marks itself failed when the TMC2209 does not
+  // answer its startup VERSION probe. Do not continue issuing UART
+  // configuration writes to hardware that is absent/unpowered.
+  if (this->is_failed()) {
+    ESP_LOGE(TAG, "TMC2209 unavailable - skipping stepper setup");
+    return;
+  }
 
   this->high_freq_.start();
 
@@ -30,185 +47,68 @@ void TMC2209Stepper::setup() {
     ESP_LOGE(TAG, "FAILED TO CONFIRM VACTUAL=0 AT STARTUP - STOP WILL RETRY");
   }
 
-  if (this->control_method_ ==
-      ControlMethod::PULSES_CONTROL) {
-
-    this->write_field(
-        MULTISTEP_FILT_FIELD, false);
-
-    /*
-     * Count both STEP pin transitions.
-     *
-     * The pulse-control implementation toggles STEP for
-     * every logical position increment, so DEDGE keeps the
-     * TMC2209's physical motion synchronized with the
-     * software position counter.
-     */
-    this->write_field(
-        DEDGE_FIELD, true);
+  if (this->control_method_ == ControlMethod::PULSES_CONTROL) {
+    this->write_field(MULTISTEP_FILT_FIELD, false);
+    this->write_field(DEDGE_FIELD, true);
   }
 
-  //BEGIN EDITS
-  // if (this->control_method_ ==
-  //     ControlMethod::SERIAL_CONTROL) {
-
-  //   /*
-  //    * Configure INDEX for pulse feedback from the driver.
-  //    * See figure 15.1 in TMC2209 datasheet rev 1.09.
-  //    */
-  //   this->write_field(
-  //       DEDGE_FIELD, false);
-
-  //   this->write_field(
-  //       INDEX_OTPW_FIELD, false);
-
-  //   this->write_field(
-  //       INDEX_STEP_FIELD, true);
-
-  //   this->ips_.current_position_ptr =
-  //       &this->current_position;
-
-  //   this->ips_.direction_ptr =
-  //       &this->current_direction;
-
-  //   this->index_pin_->attach_interrupt(
-  //       IndexPulseStore::pulse_isr,
-  //       &this->ips_,
-  //       gpio::INTERRUPT_ANY_EDGE);
-  // }
-
-    if (this->control_method_ ==
-      ControlMethod::SERIAL_CONTROL) {
-
-    /*
-     * SERIAL_CONTROL requires:
-     *
-     *   INDEX_OTPW       = 0  -> INDEX is not OTPW
-     *   INDEX_STEP       = 1  -> INDEX toggles for every internal step
-     *   MSTEP_REG_SELECT = 1  -> MRES register controls microstepping
-     *
-     * Do not rely on several independent GCONF read/modify/write
-     * operations here. Build the required final GCONF value and
-     * verify that the driver actually retained it.
-     */
-
-    this->write_field(
-        DEDGE_FIELD, false);
-
+  if (this->control_method_ == ControlMethod::SERIAL_CONTROL) {
+    this->write_field(DEDGE_FIELD, false);
     bool gconf_ok = false;
 
-    for (uint8_t attempt = 1;
-         attempt <= 5;
-         attempt++) {
+    for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+      int32_t current_gconf = this->read_register(GCONF);
+      int32_t desired_gconf = current_gconf;
+      desired_gconf &= ~(static_cast<int32_t>(1UL << 4));
+      desired_gconf |= static_cast<int32_t>(1UL << 5);
+      desired_gconf |= static_cast<int32_t>(1UL << 7);
 
-      int32_t current_gconf =
-          this->read_register(GCONF);
+      ESP_LOGI(TAG,
+               "SERIAL GCONF attempt %u: current=0x%08lX desired=0x%08lX",
+               attempt,
+               static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
+               static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
 
-      /*
-       * GCONF:
-       * bit 4 INDEX_OTPW       -> clear
-       * bit 5 INDEX_STEP       -> set
-       * bit 7 MSTEP_REG_SELECT -> set
-       *
-       * Preserve every unrelated GCONF bit.
-       */
-      int32_t desired_gconf =
-          current_gconf;
-
-      desired_gconf &=
-          ~(static_cast<int32_t>(1UL << 4));
-
-      desired_gconf |=
-          static_cast<int32_t>(1UL << 5);
-
-      desired_gconf |=
-          static_cast<int32_t>(1UL << 7);
-
-      ESP_LOGI(
-          TAG,
-          "SERIAL GCONF attempt %u: current=0x%08lX desired=0x%08lX",
-          attempt,
-          static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
-          static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
-
-      const bool write_ok =
-          this->write_register(
-              GCONF,
-              desired_gconf);
-
+      const bool write_ok = this->write_register(GCONF, desired_gconf);
       if (!write_ok) {
-        ESP_LOGW(
-            TAG,
-            "SERIAL GCONF attempt %u write was not confirmed",
-            attempt);
-
+        ESP_LOGW(TAG, "SERIAL GCONF attempt %u write was not confirmed", attempt);
         continue;
       }
 
-      const int32_t verified_gconf =
-          this->read_register(GCONF);
-
+      const int32_t verified_gconf = this->read_register(GCONF);
       const bool index_step_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 5)) != 0;
-
+          (verified_gconf & static_cast<int32_t>(1UL << 5)) != 0;
       const bool index_otpw_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 4)) == 0;
-
+          (verified_gconf & static_cast<int32_t>(1UL << 4)) == 0;
       const bool mstep_reg_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 7)) != 0;
+          (verified_gconf & static_cast<int32_t>(1UL << 7)) != 0;
 
-      ESP_LOGI(
-          TAG,
-          "SERIAL GCONF verify: 0x%08lX "
-          "INDEX_STEP=%u INDEX_OTPW=%u MSTEP_REG_SELECT=%u",
-          static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)),
-          index_step_ok,
-          !index_otpw_ok,
-          mstep_reg_ok);
+      ESP_LOGI(TAG,
+               "SERIAL GCONF verify: 0x%08lX INDEX_STEP=%u INDEX_OTPW=%u MSTEP_REG_SELECT=%u",
+               static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)),
+               index_step_ok, !index_otpw_ok, mstep_reg_ok);
 
-      if (index_step_ok &&
-          index_otpw_ok &&
-          mstep_reg_ok) {
-
+      if (index_step_ok && index_otpw_ok && mstep_reg_ok) {
         gconf_ok = true;
         break;
       }
 
-      ESP_LOGW(
-          TAG,
-          "SERIAL GCONF verification failed on attempt %u",
-          attempt);
+      ESP_LOGW(TAG, "SERIAL GCONF verification failed on attempt %u", attempt);
     }
 
     if (!gconf_ok) {
-      ESP_LOGE(
-          TAG,
-          "FAILED TO CONFIGURE SERIAL INDEX FEEDBACK");
+      ESP_LOGE(TAG, "FAILED TO CONFIGURE SERIAL INDEX FEEDBACK");
     } else {
-      ESP_LOGI(
-          TAG,
-          "SERIAL INDEX FEEDBACK CONFIGURED");
+      ESP_LOGI(TAG, "SERIAL INDEX FEEDBACK CONFIGURED");
     }
 
-    this->ips_.current_position_ptr =
-        &this->current_position;
-
-    this->ips_.direction_ptr =
-        &this->current_direction;
-
-    this->index_pin_->attach_interrupt(
-        IndexPulseStore::pulse_isr,
-        &this->ips_,
-        gpio::INTERRUPT_ANY_EDGE);
+    this->ips_.current_position_ptr = &this->current_position;
+    this->ips_.direction_ptr = &this->current_direction;
+    this->index_pin_->attach_interrupt(IndexPulseStore::pulse_isr, &this->ips_,
+                                       gpio::INTERRUPT_ANY_EDGE);
   }
-  //END EDIT
 
-  ESP_LOGCONFIG(
-      TAG,
-      "TMC2209 Stepper setup done.");
+  ESP_LOGCONFIG(TAG, "TMC2209 Stepper setup done.");
 }
 
 void TMC2209Stepper::on_shutdown() {
@@ -216,104 +116,56 @@ void TMC2209Stepper::on_shutdown() {
 }
 
 void TMC2209Stepper::loop() {
+  // Once setup has marked the driver failed, this component must become
+  // completely inert for the rest of the boot. In particular, do not call
+  // the base loop because it may perform UART health/status transactions.
+  if (this->is_failed()) {
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
+
   TMC2209Component::loop();
 
   const time_t now = micros();
-
-  /*
-   * ESPHome Stepper handles acceleration/deceleration and
-   * updates current_speed_.
-   */
   this->calculate_speed_(now);
 
-  const int32_t to_target =
-      this->target_position -
-      this->current_position;
-
+  const int32_t to_target = this->target_position - this->current_position;
   this->current_direction =
       (to_target != 0)
-          ? static_cast<Direction>(
-                to_target / abs(to_target))
+          ? static_cast<Direction>(to_target / abs(to_target))
           : Direction::STANDSTILL;
 
-  /*
-   * ------------------------------------------------------
-   * UART / VACTUAL CONTROL
-   * ------------------------------------------------------
-   *
-   * VACTUAL uses the TMC2209 clock-dependent conversion.
-   * Keep speed_to_vactual() ONLY in this control mode.
-   */
-  if (this->control_method_ ==
-      ControlMethod::SERIAL_CONTROL) {
-
-    /*
-     * Do not let the TMC2209 internal velocity generator run until
-     * set_target() has explicitly established a target.
-     */
+  if (this->control_method_ == ControlMethod::SERIAL_CONTROL) {
     if (!this->target_initialized_) {
       if (this->vactual_ != 0) {
         if (this->write_field(VACTUAL_FIELD, 0)) {
           this->vactual_ = 0;
         } else {
           this->vactual_ = 1;
-          ESP_LOGE(
-              TAG,
-              "FAILED TO CONFIRM VACTUAL=0 BEFORE TARGET INITIALIZATION");
+          ESP_LOGE(TAG, "FAILED TO CONFIRM VACTUAL=0 BEFORE TARGET INITIALIZATION");
         }
       }
-
-      this->current_direction =
-          Direction::STANDSTILL;
+      this->current_direction = Direction::STANDSTILL;
       return;
     }
 
     int32_t requested_vactual = 0;
-
-    if (this->current_direction !=
-            Direction::STANDSTILL &&
+    if (this->current_direction != Direction::STANDSTILL &&
         this->current_speed_ > 0.0f) {
-
-      requested_vactual =
-          this->speed_to_vactual(
-              static_cast<int32_t>(
-                  this->current_speed_));
-
-      requested_vactual *=
-          static_cast<int32_t>(
-              this->current_direction);
+      requested_vactual = this->speed_to_vactual(
+          static_cast<int32_t>(this->current_speed_));
+      requested_vactual *= static_cast<int32_t>(this->current_direction);
     }
 
-    if (this->vactual_ !=
-        requested_vactual) {
-
-      const bool confirmed =
-          this->write_field(
-              VACTUAL_FIELD,
-              requested_vactual);
-
+    if (this->vactual_ != requested_vactual) {
+      const bool confirmed = this->write_field(VACTUAL_FIELD, requested_vactual);
       if (confirmed) {
-        // Only mirror the hardware state after IFCNT confirmed the write.
-        this->vactual_ =
-            requested_vactual;
+        this->vactual_ = requested_vactual;
       } else {
-        ESP_LOGE(
-            TAG,
-            "VACTUAL write failed: requested=%ld",
-            static_cast<long>(requested_vactual));
-
-        // Most important case: target reached, but the motor-stop write
-        // did not make it to the TMC2209. Do NOT cache a false zero.
-        // Leaving vactual_ different from requested_vactual causes the
-        // next loop iteration to retry the stop command.
+        ESP_LOGE(TAG, "VACTUAL write failed: requested=%ld",
+                 static_cast<long>(requested_vactual));
         if (requested_vactual == 0) {
-          ESP_LOGE(
-              TAG,
-              "FAILED TO CONFIRM MOTOR STOP - RETRYING VACTUAL=0");
-
-          // If vactual_ is already zero because this firmware has just
-          // started or stop() previously failed, force a mismatch so the
-          // next loop cannot suppress the retry.
+          ESP_LOGE(TAG, "FAILED TO CONFIRM MOTOR STOP - RETRYING VACTUAL=0");
           if (this->vactual_ == 0) {
             this->vactual_ = 1;
           }
@@ -322,241 +174,90 @@ void TMC2209Stepper::loop() {
     }
   }
 
-  /*
-   * ------------------------------------------------------
-   * STEP / DIR PULSE CONTROL
-   * ------------------------------------------------------
-   *
-   * IMPORTANT:
-   *
-   * current_speed_ is already expressed by ESPHome in
-   * steps/second.
-   *
-   * Do NOT pass it through speed_to_vactual().
-   *
-   * speed_to_vactual() is a conversion for the TMC2209
-   * UART VACTUAL register and introduces the chip-clock
-   * conversion factor. That conversion does not belong in
-   * an externally generated STEP/DIR timing calculation.
-   */
-  if (this->control_method_ ==
-      ControlMethod::PULSES_CONTROL) {
-
-    /*
-     * Nothing to generate if stopped, at target, or if the
-     * acceleration profile currently requests zero speed.
-     */
-    if (this->current_direction ==
-            Direction::STANDSTILL ||
+  if (this->control_method_ == ControlMethod::PULSES_CONTROL) {
+    if (this->current_direction == Direction::STANDSTILL ||
         this->current_speed_ <= 0.0f) {
-
       return;
     }
 
-    /*
-     * In this implementation DEDGE=true, so each STEP pin
-     * transition represents one logical step.
-     *
-     * Therefore the interval between transitions is simply:
-     *
-     *   1,000,000 / requested_steps_per_second
-     */
-    const float pulse_interval_us =
-        1000000.0f /
-        this->current_speed_;
+    const float pulse_interval_us = 1000000.0f / this->current_speed_;
+    const uint32_t dt = static_cast<uint32_t>(now - this->last_step_);
 
-    const uint32_t dt =
-        static_cast<uint32_t>(
-            now - this->last_step_);
-
-    if (static_cast<float>(dt) >=
-        pulse_interval_us) {
-
-      /*
-       * Update DIR before generating the next STEP edge.
-       */
-      if (this->direction_ !=
-          this->current_direction) {
-
+    if (static_cast<float>(dt) >= pulse_interval_us) {
+      if (this->direction_ != this->current_direction) {
         this->dir_pin_->digital_write(
-            this->current_direction ==
-            Direction::BACKWARD);
-
-        this->direction_ =
-            this->current_direction;
+            this->current_direction == Direction::BACKWARD);
+        this->direction_ = this->current_direction;
       }
 
-      /*
-       * Generate exactly ONE STEP transition.
-       *
-       * Do not use a catch-up while-loop here. Multiple
-       * back-to-back transitions produced the runaway-fast
-       * behavior seen during our previous test.
-       */
-      this->step_pin_->digital_write(
-          this->step_state_);
-
-      this->step_state_ =
-          !this->step_state_;
-
-      /*
-       * DEDGE=true means every transition is counted by
-       * the TMC2209, matching one logical position unit.
-       */
-      this->current_position +=
-          static_cast<int32_t>(
-              this->current_direction);
-
-      /*
-       * Deliberately anchor timing to the actual emitted
-       * edge.
-       *
-       * We are NOT doing catch-up bursts.
-       */
+      this->step_pin_->digital_write(this->step_state_);
+      this->step_state_ = !this->step_state_;
+      this->current_position += static_cast<int32_t>(this->current_direction);
       this->last_step_ = now;
     }
   }
 }
 
-//BEGIN EDITS
-// void TMC2209Stepper::set_target(
-//     int32_t steps) {
-
-//   if (this->control_method_ ==
-//       ControlMethod::CONTROL_UNSET) {
-
-//     ESP_LOGE(
-//         TAG,
-//         "Control method not set!");
-
-//     return;
-//   }
-
-//   if (!this->is_enabled_) {
-//     this->enable(true);
-//   }
-
-//   Stepper::set_target(steps);
-// }
-
-void TMC2209Stepper::set_target(
-    int32_t steps) {
-
-  if (this->control_method_ ==
-      ControlMethod::CONTROL_UNSET) {
-
-    ESP_LOGE(
-        TAG,
-        "Control method not set!");
-
+void TMC2209Stepper::set_target(int32_t steps) {
+  // set_target() can be called by ESPHome/YAML during startup even after this
+  // component has been marked failed. Reject it before ANY register access.
+  if (this->is_failed()) {
+    this->current_direction = Direction::STANDSTILL;
+    this->target_position = this->current_position;
+    ESP_LOGW(TAG, "Ignoring target command because TMC2209 is unavailable");
     return;
   }
 
-  /*
-   * SERIAL_CONTROL absolutely depends on INDEX providing
-   * internal step feedback.
-   *
-   * Verify and repair GCONF immediately before accepting
-   * a movement command. This prevents a later configuration
-   * write or driver reset from silently disabling INDEX_STEP.
-   */
-  if (this->control_method_ ==
-      ControlMethod::SERIAL_CONTROL) {
+  if (this->control_method_ == ControlMethod::CONTROL_UNSET) {
+    ESP_LOGE(TAG, "Control method not set!");
+    return;
+  }
 
+  if (this->control_method_ == ControlMethod::SERIAL_CONTROL) {
     bool gconf_ok = false;
 
-    for (uint8_t attempt = 1;
-         attempt <= 5;
-         attempt++) {
-
-      const int32_t current_gconf =
-          this->read_register(GCONF);
-
-      int32_t desired_gconf =
-          current_gconf;
-
-      // INDEX_OTPW = 0
-      desired_gconf &=
-          ~(static_cast<int32_t>(1UL << 4));
-
-      // INDEX_STEP = 1
-      desired_gconf |=
-          static_cast<int32_t>(1UL << 5);
-
-      // MSTEP_REG_SELECT = 1
-      desired_gconf |=
-          static_cast<int32_t>(1UL << 7);
+    for (uint8_t attempt = 1; attempt <= 5; attempt++) {
+      const int32_t current_gconf = this->read_register(GCONF);
+      int32_t desired_gconf = current_gconf;
+      desired_gconf &= ~(static_cast<int32_t>(1UL << 4));
+      desired_gconf |= static_cast<int32_t>(1UL << 5);
+      desired_gconf |= static_cast<int32_t>(1UL << 7);
 
       if (desired_gconf != current_gconf) {
+        ESP_LOGW(TAG,
+                 "Repairing SERIAL GCONF before move: 0x%08lX -> 0x%08lX",
+                 static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
+                 static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
 
-        ESP_LOGW(
-            TAG,
-            "Repairing SERIAL GCONF before move: "
-            "0x%08lX -> 0x%08lX",
-            static_cast<unsigned long>(static_cast<uint32_t>(current_gconf)),
-            static_cast<unsigned long>(static_cast<uint32_t>(desired_gconf)));
-
-        if (!this->write_register(
-                GCONF,
-                desired_gconf)) {
-
-          ESP_LOGW(
-              TAG,
-              "SERIAL GCONF repair attempt %u "
-              "was not confirmed",
-              attempt);
-
+        if (!this->write_register(GCONF, desired_gconf)) {
+          ESP_LOGW(TAG,
+                   "SERIAL GCONF repair attempt %u was not confirmed",
+                   attempt);
           continue;
         }
       }
 
-      const int32_t verified_gconf =
-          this->read_register(GCONF);
-
+      const int32_t verified_gconf = this->read_register(GCONF);
       const bool index_step_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 5)) != 0;
-
+          (verified_gconf & static_cast<int32_t>(1UL << 5)) != 0;
       const bool index_otpw_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 4)) == 0;
-
+          (verified_gconf & static_cast<int32_t>(1UL << 4)) == 0;
       const bool mstep_reg_ok =
-          (verified_gconf &
-           static_cast<int32_t>(1UL << 7)) != 0;
+          (verified_gconf & static_cast<int32_t>(1UL << 7)) != 0;
 
-      if (index_step_ok &&
-          index_otpw_ok &&
-          mstep_reg_ok) {
-
+      if (index_step_ok && index_otpw_ok && mstep_reg_ok) {
         gconf_ok = true;
-
-        ESP_LOGI(
-            TAG,
-            "SERIAL GCONF ready for move: "
-            "0x%08lX",
-            static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)));
-
+        ESP_LOGI(TAG, "SERIAL GCONF ready for move: 0x%08lX",
+                 static_cast<unsigned long>(static_cast<uint32_t>(verified_gconf)));
         break;
       }
     }
 
     if (!gconf_ok) {
-
-      ESP_LOGE(
-          TAG,
-          "MOVE REJECTED - SERIAL INDEX "
-          "CONFIGURATION COULD NOT BE VERIFIED");
-
-      /*
-       * Safety: do not allow VACTUAL motion if INDEX
-       * feedback cannot be guaranteed.
-       */
-      this->write_field(
-          VACTUAL_FIELD, 0);
-
+      ESP_LOGE(TAG,
+               "MOVE REJECTED - SERIAL INDEX CONFIGURATION COULD NOT BE VERIFIED");
+      this->write_field(VACTUAL_FIELD, 0);
       this->vactual_ = 0;
-
       return;
     }
   }
@@ -568,56 +269,55 @@ void TMC2209Stepper::set_target(
   this->target_initialized_ = true;
   Stepper::set_target(steps);
 }
-//END EDITS
 
 void TMC2209Stepper::stop() {
   Stepper::stop();
 
-  if (this->control_method_ ==
-      ControlMethod::SERIAL_CONTROL) {
+  // A failed/absent driver cannot be stopped over UART. Keep software state
+  // stopped and return without touching the bus.
+  if (this->is_failed()) {
+    this->vactual_ = 0;
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
 
-    const bool confirmed =
-        this->write_field(
-            VACTUAL_FIELD, 0);
-
+  if (this->control_method_ == ControlMethod::SERIAL_CONTROL) {
+    const bool confirmed = this->write_field(VACTUAL_FIELD, 0);
     if (confirmed) {
       this->vactual_ = 0;
     } else {
-      // Never cache a false zero. Force loop() to retry VACTUAL=0.
       this->vactual_ = 1;
-
-      ESP_LOGE(
-          TAG,
-          "FAILED TO CONFIRM VACTUAL=0 STOP - STOP WILL RETRY");
+      ESP_LOGE(TAG, "FAILED TO CONFIRM VACTUAL=0 STOP - STOP WILL RETRY");
     }
   }
 }
 
-void TMC2209Stepper::enable(
-    bool enable) {
+void TMC2209Stepper::enable(bool enable) {
+  // Do not let output/config actions revive UART traffic after startup failure.
+  if (this->is_failed()) {
+    this->is_enabled_ = false;
+    this->current_direction = Direction::STANDSTILL;
+    return;
+  }
 
   if (!enable) {
     this->stop();
   }
-
   TMC2209Component::enable(enable);
 }
 
 bool TMC2209Stepper::is_stalled() {
-  if (this->current_direction ==
-      Direction::STANDSTILL) {
-
+  if (this->is_failed()) {
     return false;
   }
 
-  const int32_t sgthrs =
-      this->read_register(SGTHRS);
+  if (this->current_direction == Direction::STANDSTILL) {
+    return false;
+  }
 
-  const int32_t sgresult =
-      this->read_register(SG_RESULT);
-
-  return (sgthrs << 1) >
-         sgresult;
+  const int32_t sgthrs = this->read_register(SGTHRS);
+  const int32_t sgresult = this->read_register(SG_RESULT);
+  return (sgthrs << 1) > sgresult;
 }
 
 }  // namespace tmc2209
