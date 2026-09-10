@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <string>
 #include <time.h>
