@@ -3,6 +3,7 @@ import esphome.config_validation as cv
 from esphome.components.esp32 import include_builtin_idf_component
 
 CODEOWNERS = ["@dotJson"]
+DEPENDENCIES = ["esp32"]
 
 CONFIG_SCHEMA = cv.Schema({})
 
