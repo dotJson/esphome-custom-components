@@ -1,8 +1,11 @@
 #pragma once
 
 // HTTP diagnostics endpoint for inspecting persistent settings stored in LittleFS.
-
-#if defined(USE_ESP32) && defined(USE_WEBSERVER)
+//
+// Keep this public interface available regardless of include order. The
+// implementation itself is compiled only when ESP32 + web_server support is
+// enabled; guarding these declarations on USE_WEBSERVER made the type alias
+// disappear when this header was parsed before ESPHome's web-server headers.
 
 namespace littlefs_web_dump {
 
@@ -16,5 +19,3 @@ void set_motion_query(MotionQuery query);
 bool register_handler();
 
 }  // namespace littlefs_web_dump
-
-#endif  // USE_ESP32 && USE_WEBSERVER
