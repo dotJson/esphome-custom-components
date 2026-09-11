@@ -15,6 +15,8 @@ namespace ldr_training {
 
 static constexpr float ADC_MAX_V = 3.3f * 0.3125f;
 static constexpr float PRIMARY_OHMS = 18000.0f;
+static constexpr float CLIP_MARGIN_V = 0.02f;
+static constexpr float PROVISIONAL_TARGET_SPAN_V = 0.40f;
 static constexpr uint16_t BIN_COUNT = 256;
 static constexpr uint32_t MAGIC = 0x4C445231U;  // LDR1
 static constexpr uint16_t VERSION = 2;
@@ -48,6 +50,7 @@ struct Result {
   float predicted_bright_v{NAN};
   float predicted_dark_v{NAN};
   bool no_secondary{true};
+  bool provisional{false};
 };
 
 struct __attribute__((packed)) Summary {
@@ -175,21 +178,39 @@ class Trainer {
     if (sample_count_ < 120) return r;
     r.bright_v = percentile(0.02f); r.dark_v = percentile(0.98f);
     r.span_v = r.dark_v - r.bright_v;
-    if (!(r.span_v > 0.01f) || r.bright_v <= 0.0f || r.dark_v >= ADC_MAX_V) return r;
+    if (!(r.span_v > 0.01f)) return r;
+    const bool bright_clipped = r.bright_v <= CLIP_MARGIN_V;
+    const bool dark_clipped = r.dark_v >= ADC_MAX_V - CLIP_MARGIN_V;
+    if (bright_clipped && dark_clipped) return r;
+    r.provisional = bright_clipped || dark_clipped;
     float margin = fmaxf(0.005f, r.span_v * 0.05f);
     r.closed_v = r.bright_v + margin; r.open_v = r.dark_v - margin;
-    const float ldr_bright = PRIMARY_OHMS * r.bright_v / (ADC_MAX_V - r.bright_v);
-    const float ldr_dark = PRIMARY_OHMS * r.dark_v / (ADC_MAX_V - r.dark_v);
+    const float safe_bright = fmaxf(0.0005f, fminf(r.bright_v, ADC_MAX_V - 0.0005f));
+    const float safe_dark = fmaxf(0.0005f, fminf(r.dark_v, ADC_MAX_V - 0.0005f));
+    const float ldr_bright = PRIMARY_OHMS * safe_bright / (ADC_MAX_V - safe_bright);
+    const float ldr_dark = PRIMARY_OHMS * safe_dark / (ADC_MAX_V - safe_dark);
     const float kit[] = {1000,1800,3000,4700,5100,7500,10000,12000,18000,33000,43000,51000,75000,100000,200000,300000,390000,470000,680000,1000000};
-    float best_score = score(PRIMARY_OHMS, ldr_bright, ldr_dark);
+    float best_score = r.provisional
+      ? score_provisional(PRIMARY_OHMS, bright_clipped ? ldr_dark : ldr_bright, bright_clipped)
+      : score(PRIMARY_OHMS, ldr_bright, ldr_dark);
     float best_eff = PRIMARY_OHMS;
     for (float parallel : kit) {
       float eff = PRIMARY_OHMS * parallel / (PRIMARY_OHMS + parallel);
-      float s = score(eff, ldr_bright, ldr_dark);
+      float s = r.provisional
+        ? score_provisional(eff, bright_clipped ? ldr_dark : ldr_bright, bright_clipped)
+        : score(eff, ldr_bright, ldr_dark);
       if (s > best_score) { best_score = s; best_eff = eff; r.recommended_parallel_ohms = parallel; r.no_secondary = false; }
     }
-    r.predicted_bright_v = ADC_MAX_V * ldr_bright / (best_eff + ldr_bright);
-    r.predicted_dark_v = ADC_MAX_V * ldr_dark / (best_eff + ldr_dark);
+    if (r.provisional && bright_clipped) {
+      r.predicted_dark_v = ADC_MAX_V * ldr_dark / (best_eff + ldr_dark);
+      r.predicted_bright_v = fmaxf(0.0f, r.predicted_dark_v - PROVISIONAL_TARGET_SPAN_V);
+    } else if (r.provisional) {
+      r.predicted_bright_v = ADC_MAX_V * ldr_bright / (best_eff + ldr_bright);
+      r.predicted_dark_v = fminf(ADC_MAX_V, r.predicted_bright_v + PROVISIONAL_TARGET_SPAN_V);
+    } else {
+      r.predicted_bright_v = ADC_MAX_V * ldr_bright / (best_eff + ldr_bright);
+      r.predicted_dark_v = ADC_MAX_V * ldr_dark / (best_eff + ldr_dark);
+    }
     r.valid = true;
     return r;
   }
@@ -209,6 +230,7 @@ class Trainer {
     char b[96];
     if (active_) snprintf(b, sizeof(b), "LEARNING %.1f%% (%" PRIu32 " samples)", progress_percent(), sample_count_);
     else if (complete_ && applied_) snprintf(b, sizeof(b), "APPLIED (%" PRIu32 " samples)", result_sample_count_);
+    else if (complete_ && result_.provisional) snprintf(b, sizeof(b), "PROVISIONAL R2 - RELEARN REQUIRED (%" PRIu32 " samples)", result_sample_count_);
     else if (complete_) snprintf(b, sizeof(b), "READY TO APPLY (%" PRIu32 " samples)", result_sample_count_);
     else snprintf(b, sizeof(b), "IDLE");
     return b;
@@ -216,8 +238,12 @@ class Trainer {
 
   std::string recommendation() const {
     if (!result_.valid) return "NOT AVAILABLE";
-    if (result_.no_secondary) return "NONE - LEAVE R-ADJUST OPEN";
-    char b[96]; snprintf(b, sizeof(b), "ADD %.1f kOhm PARALLEL (R-effective %.1f kOhm)", result_.recommended_parallel_ohms / 1000.0f,
+    if (result_.no_secondary) return result_.provisional
+      ? "PROVISIONAL - LEAVE R-ADJUST OPEN; RELEARN REQUIRED"
+      : "NONE - LEAVE R-ADJUST OPEN";
+    char b[128]; snprintf(b, sizeof(b), result_.provisional
+      ? "PROVISIONAL - ADD %.1f kOhm PARALLEL (R-effective %.1f kOhm); RELEARN REQUIRED"
+      : "ADD %.1f kOhm PARALLEL (R-effective %.1f kOhm)", result_.recommended_parallel_ohms / 1000.0f,
       (PRIMARY_OHMS * result_.recommended_parallel_ohms / (PRIMARY_OHMS + result_.recommended_parallel_ohms)) / 1000.0f);
     return b;
   }
@@ -237,6 +263,13 @@ class Trainer {
     if (vb < 0.10f) score -= (0.10f - vb) * 3.0f;
     if (vd > 0.93f) score -= (vd - 0.93f) * 3.0f;
     return score;
+  }
+  static float score_provisional(float top, float known_ldr, bool known_is_dark) {
+    const float known_v = ADC_MAX_V * known_ldr / (top + known_ldr);
+    const float target_midpoint = ADC_MAX_V * 0.5f;
+    const float target_v = target_midpoint +
+      (known_is_dark ? PROVISIONAL_TARGET_SPAN_V * 0.5f : -PROVISIONAL_TARGET_SPAN_V * 0.5f);
+    return -fabsf(known_v - target_v);
   }
   static uint32_t crc32(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFFU;
@@ -280,6 +313,7 @@ class Trainer {
     result_.closed_v = s.closed_v; result_.open_v = s.open_v;
     result_.recommended_parallel_ohms = s.recommended_parallel_ohms;
     result_.predicted_bright_v = s.predicted_bright_v; result_.predicted_dark_v = s.predicted_dark_v;
+    result_.provisional = (s.reserved & 0x0001U) != 0;
     result_.no_secondary = s.no_secondary != 0;
     result_sample_count_ = s.sample_count; applied_ = s.applied != 0; complete_ = true;
     ESP_LOGI("ldr_training", "Restored completed result (%" PRIu32 " samples, %s)", result_sample_count_, applied_ ? "applied" : "not applied");
@@ -296,6 +330,7 @@ class Trainer {
     s.closed_v = result_.closed_v; s.open_v = result_.open_v;
     s.recommended_parallel_ohms = result_.recommended_parallel_ohms;
     s.predicted_bright_v = result_.predicted_bright_v; s.predicted_dark_v = result_.predicted_dark_v;
+    s.reserved = result_.provisional ? 0x0001U : 0U;
     s.no_secondary = result_.no_secondary ? 1 : 0; s.applied = applied_ ? 1 : 0;
     s.crc32 = crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
     FILE *f = fopen(SUMMARY_TMP, "wb"); if (f == nullptr) return;
