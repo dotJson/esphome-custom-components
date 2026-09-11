@@ -86,6 +86,8 @@ class Trainer {
     elapsed_before_boot_s_ = 0;
     started_ms_ = millis();
     last_checkpoint_ms_ = motor_idle ? started_ms_ : started_ms_ - 3600000U;
+    last_checkpoint_attempt_ms_ = 0;
+    last_checkpoint_ok_ = false;
     duration_s_ = duration_hours * 3600U;
     active_ = true;
     // Keep the last completed result visible until this run succeeds.
@@ -119,17 +121,22 @@ class Trainer {
 
   bool checkpoint() {
     if (!active_) return false;
+    last_checkpoint_attempt_ms_ = millis();
     Checkpoint cp{};
     cp.magic = MAGIC; cp.version = VERSION; cp.bins = BIN_COUNT;
     cp.duration_seconds = duration_s_; cp.elapsed_seconds = elapsed_seconds(); cp.sample_count = sample_count_;
     memcpy(cp.histogram, histogram_.data(), sizeof(cp.histogram));
     cp.crc32 = crc32(reinterpret_cast<const uint8_t *>(&cp), sizeof(cp) - sizeof(cp.crc32));
     FILE *f = fopen(CHECKPOINT_TMP, "wb");
-    if (f == nullptr) return false;
+    if (f == nullptr) {
+      last_checkpoint_ok_ = false;
+      return false;
+    }
     bool ok = fwrite(&cp, 1, sizeof(cp), f) == sizeof(cp) && fflush(f) == 0;
     fclose(f);
     if (ok) ok = replace_safely(CHECKPOINT_TMP, CHECKPOINT, CHECKPOINT_BAK);
     if (!ok) std::remove(CHECKPOINT_TMP);
+    last_checkpoint_ok_ = ok;
     if (ok) last_checkpoint_ms_ = millis();
     return ok;
   }
@@ -145,7 +152,8 @@ class Trainer {
     if (!found || cp.elapsed_seconds >= cp.duration_seconds) return false;
     duration_s_ = cp.duration_seconds; elapsed_before_boot_s_ = cp.elapsed_seconds;
     sample_count_ = cp.sample_count; memcpy(histogram_.data(), cp.histogram, sizeof(cp.histogram));
-    started_ms_ = millis(); last_checkpoint_ms_ = started_ms_; active_ = true;
+    started_ms_ = millis(); last_checkpoint_ms_ = 0; last_checkpoint_attempt_ms_ = 0;
+    last_checkpoint_ok_ = false; active_ = true;
     ESP_LOGI("ldr_training", "Restored %" PRIu32 " samples at %.1f%%", sample_count_, progress_percent());
     checkpoint();
     return true;
@@ -226,6 +234,44 @@ class Trainer {
   }
   const Result &result() const { return result_; }
 
+  uint16_t occupied_bins() const {
+    uint16_t count = 0;
+    for (uint32_t samples : histogram_) if (samples != 0) count++;
+    return count;
+  }
+
+  float minimum_observed_voltage() const {
+    for (uint16_t i = 0; i < BIN_COUNT; i++) {
+      if (histogram_[i] != 0) return bin_midpoint(i);
+    }
+    return NAN;
+  }
+
+  float maximum_observed_voltage() const {
+    for (int i = BIN_COUNT - 1; i >= 0; i--) {
+      if (histogram_[i] != 0) return bin_midpoint(static_cast<uint16_t>(i));
+    }
+    return NAN;
+  }
+
+  float low_rail_percent() const { return rail_percent(false); }
+  float high_rail_percent() const { return rail_percent(true); }
+
+  float checkpoint_age_minutes() const {
+    if (last_checkpoint_ms_ == 0) return NAN;
+    return static_cast<float>(static_cast<uint32_t>(millis() - last_checkpoint_ms_)) / 60000.0f;
+  }
+
+  std::string checkpoint_status() const {
+    char b[64];
+    if (!active_) return "INACTIVE";
+    if (last_checkpoint_attempt_ms_ == 0) return "PENDING FIRST CHECKPOINT";
+    const uint32_t age_s = static_cast<uint32_t>(millis() - last_checkpoint_attempt_ms_) / 1000U;
+    snprintf(b, sizeof(b), "%s - %lu s AGO", last_checkpoint_ok_ ? "OK" : "FAILED",
+      static_cast<unsigned long>(age_s));
+    return b;
+  }
+
   std::string status() const {
     char b[96];
     if (active_) snprintf(b, sizeof(b), "LEARNING %.1f%% (%" PRIu32 " samples)", progress_percent(), sample_count_);
@@ -249,6 +295,22 @@ class Trainer {
   }
 
  private:
+  static float bin_midpoint(uint16_t i) {
+    return (static_cast<float>(i) + 0.5f) * ADC_MAX_V / BIN_COUNT;
+  }
+
+  float rail_percent(bool high) const {
+    if (sample_count_ == 0) return NAN;
+    uint32_t rail_samples = 0;
+    for (uint16_t i = 0; i < BIN_COUNT; i++) {
+      const float v = bin_midpoint(i);
+      if ((!high && v <= CLIP_MARGIN_V) || (high && v >= ADC_MAX_V - CLIP_MARGIN_V)) {
+        rail_samples += histogram_[i];
+      }
+    }
+    return 100.0f * static_cast<float>(rail_samples) / static_cast<float>(sample_count_);
+  }
+
   uint32_t elapsed_seconds() const { return elapsed_before_boot_s_ + ((uint32_t)(millis() - started_ms_) / 1000U); }
   float percentile(float p) const {
     uint32_t target = static_cast<uint32_t>(ceilf(sample_count_ * p)); if (target < 1) target = 1;
@@ -341,8 +403,9 @@ class Trainer {
 
   std::array<uint32_t, BIN_COUNT> histogram_{};
   uint32_t sample_count_{0}, duration_s_{0}, elapsed_before_boot_s_{0}, started_ms_{0}, last_checkpoint_ms_{0};
+  uint32_t last_checkpoint_attempt_ms_{0};
   uint32_t result_sample_count_{0};
-  bool active_{false}, complete_{false}, applied_{false};
+  bool active_{false}, complete_{false}, applied_{false}, last_checkpoint_ok_{false};
   Result result_{};
 };
 
