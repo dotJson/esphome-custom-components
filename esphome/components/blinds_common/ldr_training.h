@@ -1,0 +1,414 @@
+#pragma once
+
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <inttypes.h>
+#include <initializer_list>
+#include <string>
+#include <time.h>
+
+#include "esphome/core/log.h"
+
+namespace ldr_training {
+
+static constexpr float ADC_MAX_V = 3.3f * 0.3125f;
+static constexpr float PRIMARY_OHMS = 18000.0f;
+static constexpr float CLIP_MARGIN_V = 0.02f;
+static constexpr float PROVISIONAL_TARGET_SPAN_V = 0.40f;
+static constexpr uint16_t BIN_COUNT = 256;
+static constexpr uint32_t MAGIC = 0x4C445231U;  // LDR1
+static constexpr uint16_t VERSION = 2;
+static constexpr const char *CHECKPOINT = "/littlefs/ldr_learn.chk";
+static constexpr const char *CHECKPOINT_TMP = "/littlefs/ldr_learn.tmp";
+static constexpr const char *CHECKPOINT_BAK = "/littlefs/ldr_learn.bak";
+static constexpr const char *SUMMARY = "/littlefs/ldr_learn_summary.bin";
+static constexpr const char *SUMMARY_TMP = "/littlefs/ldr_learn_summary.tmp";
+static constexpr const char *SUMMARY_BAK = "/littlefs/ldr_learn_summary.bak";
+static constexpr const char *LEGACY_SUMMARY = "/littlefs/ldr_learn_summary.txt";
+
+struct __attribute__((packed)) Checkpoint {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t bins;
+  uint32_t duration_seconds;
+  uint32_t elapsed_seconds;
+  uint32_t sample_count;
+  uint32_t histogram[BIN_COUNT];
+  uint32_t crc32;
+};
+
+struct Result {
+  bool valid{false};
+  float bright_v{NAN};
+  float dark_v{NAN};
+  float span_v{NAN};
+  float closed_v{NAN};
+  float open_v{NAN};
+  float recommended_parallel_ohms{NAN};
+  float predicted_bright_v{NAN};
+  float predicted_dark_v{NAN};
+  bool no_secondary{true};
+  bool provisional{false};
+};
+
+struct __attribute__((packed)) Summary {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t sample_count;
+  float bright_v;
+  float dark_v;
+  float span_v;
+  float closed_v;
+  float open_v;
+  float recommended_parallel_ohms;
+  float predicted_bright_v;
+  float predicted_dark_v;
+  uint8_t no_secondary;
+  uint8_t applied;
+  uint8_t padding[2];
+  uint32_t crc32;
+};
+
+class Trainer {
+ public:
+  void begin() {
+    restore_summary();
+    restore();
+    std::remove(LEGACY_SUMMARY);
+  }
+
+  void start(uint32_t duration_hours, bool motor_idle) {
+    histogram_.fill(0);
+    sample_count_ = 0;
+    elapsed_before_boot_s_ = 0;
+    started_ms_ = millis();
+    last_checkpoint_ms_ = motor_idle ? started_ms_ : started_ms_ - 3600000U;
+    last_checkpoint_attempt_ms_ = 0;
+    last_checkpoint_ok_ = false;
+    duration_s_ = duration_hours * 3600U;
+    active_ = true;
+    // Keep the last completed result visible until this run succeeds.
+    std::remove(CHECKPOINT);
+    ESP_LOGI("ldr_training", "Learning started for %" PRIu32 " hour(s)", duration_hours);
+    if (motor_idle) checkpoint();
+  }
+
+  void cancel() {
+    active_ = false;
+    histogram_.fill(0);
+    sample_count_ = 0;
+    std::remove(CHECKPOINT);
+    ESP_LOGI("ldr_training", "Learning cancelled; checkpoint removed");
+  }
+
+  void add_sample(float volts) {
+    if (!active_ || !std::isfinite(volts) || volts < 0.0f || volts > ADC_MAX_V * 1.02f) return;
+    float clipped = volts < 0.0f ? 0.0f : (volts > ADC_MAX_V ? ADC_MAX_V : volts);
+    uint16_t bin = static_cast<uint16_t>(floorf((clipped / ADC_MAX_V) * BIN_COUNT));
+    if (bin >= BIN_COUNT) bin = BIN_COUNT - 1;
+    if (histogram_[bin] != UINT32_MAX) histogram_[bin]++;
+    if (sample_count_ != UINT32_MAX) sample_count_++;
+    if (elapsed_seconds() >= duration_s_) finish();
+  }
+
+  bool checkpoint_if_due(bool motor_idle) {
+    if (!active_ || !motor_idle || (uint32_t)(millis() - last_checkpoint_ms_) < 3600000U) return false;
+    return checkpoint();
+  }
+
+  bool checkpoint() {
+    if (!active_) return false;
+    last_checkpoint_attempt_ms_ = millis();
+    Checkpoint cp{};
+    cp.magic = MAGIC; cp.version = VERSION; cp.bins = BIN_COUNT;
+    cp.duration_seconds = duration_s_; cp.elapsed_seconds = elapsed_seconds(); cp.sample_count = sample_count_;
+    memcpy(cp.histogram, histogram_.data(), sizeof(cp.histogram));
+    cp.crc32 = crc32(reinterpret_cast<const uint8_t *>(&cp), sizeof(cp) - sizeof(cp.crc32));
+    FILE *f = fopen(CHECKPOINT_TMP, "wb");
+    if (f == nullptr) {
+      last_checkpoint_ok_ = false;
+      return false;
+    }
+    bool ok = fwrite(&cp, 1, sizeof(cp), f) == sizeof(cp) && fflush(f) == 0;
+    fclose(f);
+    if (ok) ok = replace_safely(CHECKPOINT_TMP, CHECKPOINT, CHECKPOINT_BAK);
+    if (!ok) std::remove(CHECKPOINT_TMP);
+    last_checkpoint_ok_ = ok;
+    if (ok) last_checkpoint_ms_ = millis();
+    return ok;
+  }
+
+  bool restore() {
+    Checkpoint cp{}, candidate{};
+    bool found = false;
+    for (const char *path : {CHECKPOINT_TMP, CHECKPOINT, CHECKPOINT_BAK}) {
+      if (read_valid_checkpoint(path, candidate) && (!found || candidate.elapsed_seconds > cp.elapsed_seconds)) {
+        cp = candidate; found = true;
+      }
+    }
+    if (!found || cp.elapsed_seconds >= cp.duration_seconds) return false;
+    duration_s_ = cp.duration_seconds; elapsed_before_boot_s_ = cp.elapsed_seconds;
+    sample_count_ = cp.sample_count; memcpy(histogram_.data(), cp.histogram, sizeof(cp.histogram));
+    started_ms_ = millis(); last_checkpoint_ms_ = 0; last_checkpoint_attempt_ms_ = 0;
+    last_checkpoint_ok_ = false; active_ = true;
+    ESP_LOGI("ldr_training", "Restored %" PRIu32 " samples at %.1f%%", sample_count_, progress_percent());
+    checkpoint();
+    return true;
+  }
+
+  void finish() {
+    if (!active_) return;
+    active_ = false;
+    Result candidate = calculate();
+    if (candidate.valid) {
+      result_ = candidate;
+      result_sample_count_ = sample_count_;
+      complete_ = true;
+      applied_ = false;
+      write_summary();
+    } else {
+      ESP_LOGW("ldr_training", "Learning ended without a valid range; retaining last good result");
+    }
+    std::remove(CHECKPOINT);
+  }
+
+  void mark_applied() {
+    if (!result_.valid) return;
+    applied_ = true;
+    write_summary();
+  }
+
+  Result calculate() const {
+    Result r{};
+    if (sample_count_ < 120) return r;
+    r.bright_v = percentile(0.02f); r.dark_v = percentile(0.98f);
+    r.span_v = r.dark_v - r.bright_v;
+    if (!(r.span_v > 0.01f)) return r;
+    const bool bright_clipped = r.bright_v <= CLIP_MARGIN_V;
+    const bool dark_clipped = r.dark_v >= ADC_MAX_V - CLIP_MARGIN_V;
+    if (bright_clipped && dark_clipped) return r;
+    r.provisional = bright_clipped || dark_clipped;
+    float margin = fmaxf(0.005f, r.span_v * 0.05f);
+    r.closed_v = r.bright_v + margin; r.open_v = r.dark_v - margin;
+    const float safe_bright = fmaxf(0.0005f, fminf(r.bright_v, ADC_MAX_V - 0.0005f));
+    const float safe_dark = fmaxf(0.0005f, fminf(r.dark_v, ADC_MAX_V - 0.0005f));
+    const float ldr_bright = PRIMARY_OHMS * safe_bright / (ADC_MAX_V - safe_bright);
+    const float ldr_dark = PRIMARY_OHMS * safe_dark / (ADC_MAX_V - safe_dark);
+    const float kit[] = {1000,1800,3000,4700,5100,7500,10000,12000,18000,33000,43000,51000,75000,100000,200000,300000,390000,470000,680000,1000000};
+    float best_score = r.provisional
+      ? score_provisional(PRIMARY_OHMS, bright_clipped ? ldr_dark : ldr_bright, bright_clipped)
+      : score(PRIMARY_OHMS, ldr_bright, ldr_dark);
+    float best_eff = PRIMARY_OHMS;
+    for (float parallel : kit) {
+      float eff = PRIMARY_OHMS * parallel / (PRIMARY_OHMS + parallel);
+      float s = r.provisional
+        ? score_provisional(eff, bright_clipped ? ldr_dark : ldr_bright, bright_clipped)
+        : score(eff, ldr_bright, ldr_dark);
+      if (s > best_score) { best_score = s; best_eff = eff; r.recommended_parallel_ohms = parallel; r.no_secondary = false; }
+    }
+    if (r.provisional && bright_clipped) {
+      r.predicted_dark_v = ADC_MAX_V * ldr_dark / (best_eff + ldr_dark);
+      r.predicted_bright_v = fmaxf(0.0f, r.predicted_dark_v - PROVISIONAL_TARGET_SPAN_V);
+    } else if (r.provisional) {
+      r.predicted_bright_v = ADC_MAX_V * ldr_bright / (best_eff + ldr_bright);
+      r.predicted_dark_v = fminf(ADC_MAX_V, r.predicted_bright_v + PROVISIONAL_TARGET_SPAN_V);
+    } else {
+      r.predicted_bright_v = ADC_MAX_V * ldr_bright / (best_eff + ldr_bright);
+      r.predicted_dark_v = ADC_MAX_V * ldr_dark / (best_eff + ldr_dark);
+    }
+    r.valid = true;
+    return r;
+  }
+
+  bool active() const { return active_; }
+  bool complete() const { return complete_; }
+  bool applied() const { return applied_; }
+  uint32_t samples() const { return sample_count_; }
+  uint32_t duration_hours() const { return duration_s_ / 3600U; }
+  float progress_percent() const {
+    if (!active_ && complete_) return 100.0f;
+    return duration_s_ ? fminf(100.0f, 100.0f * elapsed_seconds() / duration_s_) : 0.0f;
+  }
+  const Result &result() const { return result_; }
+
+  uint16_t occupied_bins() const {
+    uint16_t count = 0;
+    for (uint32_t samples : histogram_) if (samples != 0) count++;
+    return count;
+  }
+
+  float minimum_observed_voltage() const {
+    for (uint16_t i = 0; i < BIN_COUNT; i++) {
+      if (histogram_[i] != 0) return bin_midpoint(i);
+    }
+    return NAN;
+  }
+
+  float maximum_observed_voltage() const {
+    for (int i = BIN_COUNT - 1; i >= 0; i--) {
+      if (histogram_[i] != 0) return bin_midpoint(static_cast<uint16_t>(i));
+    }
+    return NAN;
+  }
+
+  float low_rail_percent() const { return rail_percent(false); }
+  float high_rail_percent() const { return rail_percent(true); }
+
+  float checkpoint_age_minutes() const {
+    if (last_checkpoint_ms_ == 0) return NAN;
+    return static_cast<float>(static_cast<uint32_t>(millis() - last_checkpoint_ms_)) / 60000.0f;
+  }
+
+  std::string checkpoint_status() const {
+    char b[64];
+    if (!active_) return "INACTIVE";
+    if (last_checkpoint_attempt_ms_ == 0) return "PENDING FIRST CHECKPOINT";
+    const uint32_t age_s = static_cast<uint32_t>(millis() - last_checkpoint_attempt_ms_) / 1000U;
+    snprintf(b, sizeof(b), "%s - %lu s AGO", last_checkpoint_ok_ ? "OK" : "FAILED",
+      static_cast<unsigned long>(age_s));
+    return b;
+  }
+
+  std::string status() const {
+    char b[96];
+    if (active_) snprintf(b, sizeof(b), "LEARNING %.1f%% (%" PRIu32 " samples)", progress_percent(), sample_count_);
+    else if (complete_ && applied_) snprintf(b, sizeof(b), "APPLIED (%" PRIu32 " samples)", result_sample_count_);
+    else if (complete_ && result_.provisional) snprintf(b, sizeof(b), "PROVISIONAL R2 - RELEARN REQUIRED (%" PRIu32 " samples)", result_sample_count_);
+    else if (complete_) snprintf(b, sizeof(b), "READY TO APPLY (%" PRIu32 " samples)", result_sample_count_);
+    else snprintf(b, sizeof(b), "IDLE");
+    return b;
+  }
+
+  std::string recommendation() const {
+    if (!result_.valid) return "NOT AVAILABLE";
+    if (result_.no_secondary) return result_.provisional
+      ? "PROVISIONAL - LEAVE R-ADJUST OPEN; RELEARN REQUIRED"
+      : "NONE - LEAVE R-ADJUST OPEN";
+    char b[128]; snprintf(b, sizeof(b), result_.provisional
+      ? "PROVISIONAL - ADD %.1f kOhm PARALLEL (R-effective %.1f kOhm); RELEARN REQUIRED"
+      : "ADD %.1f kOhm PARALLEL (R-effective %.1f kOhm)", result_.recommended_parallel_ohms / 1000.0f,
+      (PRIMARY_OHMS * result_.recommended_parallel_ohms / (PRIMARY_OHMS + result_.recommended_parallel_ohms)) / 1000.0f);
+    return b;
+  }
+
+ private:
+  static float bin_midpoint(uint16_t i) {
+    return (static_cast<float>(i) + 0.5f) * ADC_MAX_V / BIN_COUNT;
+  }
+
+  float rail_percent(bool high) const {
+    if (sample_count_ == 0) return NAN;
+    uint32_t rail_samples = 0;
+    for (uint16_t i = 0; i < BIN_COUNT; i++) {
+      const float v = bin_midpoint(i);
+      if ((!high && v <= CLIP_MARGIN_V) || (high && v >= ADC_MAX_V - CLIP_MARGIN_V)) {
+        rail_samples += histogram_[i];
+      }
+    }
+    return 100.0f * static_cast<float>(rail_samples) / static_cast<float>(sample_count_);
+  }
+
+  uint32_t elapsed_seconds() const { return elapsed_before_boot_s_ + ((uint32_t)(millis() - started_ms_) / 1000U); }
+  float percentile(float p) const {
+    uint32_t target = static_cast<uint32_t>(ceilf(sample_count_ * p)); if (target < 1) target = 1;
+    uint32_t cumulative = 0;
+    for (uint16_t i = 0; i < BIN_COUNT; i++) { cumulative += histogram_[i]; if (cumulative >= target) return (i + 0.5f) * ADC_MAX_V / BIN_COUNT; }
+    return ADC_MAX_V;
+  }
+  static float score(float top, float rb, float rd) {
+    float vb = ADC_MAX_V * rb / (top + rb), vd = ADC_MAX_V * rd / (top + rd);
+    float span = vd - vb, midpoint = (vd + vb) * 0.5f;
+    float score = span - 0.35f * fabsf(midpoint - ADC_MAX_V * 0.5f);
+    if (vb < 0.10f) score -= (0.10f - vb) * 3.0f;
+    if (vd > 0.93f) score -= (vd - 0.93f) * 3.0f;
+    return score;
+  }
+  static float score_provisional(float top, float known_ldr, bool known_is_dark) {
+    const float known_v = ADC_MAX_V * known_ldr / (top + known_ldr);
+    const float target_midpoint = ADC_MAX_V * 0.5f;
+    const float target_v = target_midpoint +
+      (known_is_dark ? PROVISIONAL_TARGET_SPAN_V * 0.5f : -PROVISIONAL_TARGET_SPAN_V * 0.5f);
+    return -fabsf(known_v - target_v);
+  }
+  static uint32_t crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFU;
+    while (len--) { crc ^= *data++; for (uint8_t i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U))); }
+    return ~crc;
+  }
+  static bool replace_safely(const char *temp, const char *final_path, const char *backup) {
+    std::remove(backup);
+    const bool had_final = std::rename(final_path, backup) == 0;
+    if (std::rename(temp, final_path) == 0) {
+      if (had_final) std::remove(backup);
+      return true;
+    }
+    if (had_final) std::rename(backup, final_path);
+    return false;
+  }
+  static bool read_valid_checkpoint(const char *path, Checkpoint &cp) {
+    FILE *f = fopen(path, "rb"); if (f == nullptr) return false;
+    const bool ok = fread(&cp, 1, sizeof(cp), f) == sizeof(cp); fclose(f);
+    if (!ok || cp.magic != MAGIC || cp.version != VERSION || cp.bins != BIN_COUNT) return false;
+    return cp.crc32 == crc32(reinterpret_cast<const uint8_t *>(&cp), sizeof(cp) - sizeof(cp.crc32));
+  }
+  static bool read_valid_summary(const char *path, Summary &s) {
+    FILE *f = fopen(path, "rb"); if (f == nullptr) return false;
+    const bool ok = fread(&s, 1, sizeof(s), f) == sizeof(s); fclose(f);
+    if (!ok || s.magic != MAGIC || s.version != VERSION) return false;
+    return s.crc32 == crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
+  }
+  bool restore_summary() {
+    Summary s{};
+    bool found = false;
+    for (const char *path : {SUMMARY_TMP, SUMMARY, SUMMARY_BAK}) {
+      if (read_valid_summary(path, s)) { found = true; break; }
+    }
+    if (!found) {
+      ESP_LOGW("ldr_training", "Ignoring invalid completed-learning summary");
+      return false;
+    }
+    result_.valid = true;
+    result_.bright_v = s.bright_v; result_.dark_v = s.dark_v; result_.span_v = s.span_v;
+    result_.closed_v = s.closed_v; result_.open_v = s.open_v;
+    result_.recommended_parallel_ohms = s.recommended_parallel_ohms;
+    result_.predicted_bright_v = s.predicted_bright_v; result_.predicted_dark_v = s.predicted_dark_v;
+    result_.provisional = (s.reserved & 0x0001U) != 0;
+    result_.no_secondary = s.no_secondary != 0;
+    result_sample_count_ = s.sample_count; applied_ = s.applied != 0; complete_ = true;
+    ESP_LOGI("ldr_training", "Restored completed result (%" PRIu32 " samples, %s)", result_sample_count_, applied_ ? "applied" : "not applied");
+    write_summary();
+    return true;
+  }
+
+  void write_summary() {
+    if (!result_.valid) return;
+    if (!result_sample_count_) result_sample_count_ = sample_count_;
+    Summary s{};
+    s.magic = MAGIC; s.version = VERSION; s.sample_count = result_sample_count_;
+    s.bright_v = result_.bright_v; s.dark_v = result_.dark_v; s.span_v = result_.span_v;
+    s.closed_v = result_.closed_v; s.open_v = result_.open_v;
+    s.recommended_parallel_ohms = result_.recommended_parallel_ohms;
+    s.predicted_bright_v = result_.predicted_bright_v; s.predicted_dark_v = result_.predicted_dark_v;
+    s.reserved = result_.provisional ? 0x0001U : 0U;
+    s.no_secondary = result_.no_secondary ? 1 : 0; s.applied = applied_ ? 1 : 0;
+    s.crc32 = crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
+    FILE *f = fopen(SUMMARY_TMP, "wb"); if (f == nullptr) return;
+    bool ok = fwrite(&s, 1, sizeof(s), f) == sizeof(s) && fflush(f) == 0; fclose(f);
+    if (ok) ok = replace_safely(SUMMARY_TMP, SUMMARY, SUMMARY_BAK);
+    if (!ok) std::remove(SUMMARY_TMP);
+  }
+
+  std::array<uint32_t, BIN_COUNT> histogram_{};
+  uint32_t sample_count_{0}, duration_s_{0}, elapsed_before_boot_s_{0}, started_ms_{0}, last_checkpoint_ms_{0};
+  uint32_t last_checkpoint_attempt_ms_{0};
+  uint32_t result_sample_count_{0};
+  bool active_{false}, complete_{false}, applied_{false}, last_checkpoint_ok_{false};
+  Result result_{};
+};
+
+inline Trainer trainer;
+
+}  // namespace ldr_training
