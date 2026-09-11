@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <inttypes.h>
+#include <initializer_list>
 #include <string>
 #include <time.h>
 
@@ -18,8 +20,11 @@ static constexpr uint32_t MAGIC = 0x4C445231U;  // LDR1
 static constexpr uint16_t VERSION = 2;
 static constexpr const char *CHECKPOINT = "/littlefs/ldr_learn.chk";
 static constexpr const char *CHECKPOINT_TMP = "/littlefs/ldr_learn.tmp";
+static constexpr const char *CHECKPOINT_BAK = "/littlefs/ldr_learn.bak";
 static constexpr const char *SUMMARY = "/littlefs/ldr_learn_summary.bin";
 static constexpr const char *SUMMARY_TMP = "/littlefs/ldr_learn_summary.tmp";
+static constexpr const char *SUMMARY_BAK = "/littlefs/ldr_learn_summary.bak";
+static constexpr const char *LEGACY_SUMMARY = "/littlefs/ldr_learn_summary.txt";
 
 struct __attribute__((packed)) Checkpoint {
   uint32_t magic;
@@ -69,19 +74,21 @@ class Trainer {
   void begin() {
     restore_summary();
     restore();
+    std::remove(LEGACY_SUMMARY);
   }
 
-  void start(uint32_t duration_hours) {
+  void start(uint32_t duration_hours, bool motor_idle) {
     histogram_.fill(0);
     sample_count_ = 0;
     elapsed_before_boot_s_ = 0;
     started_ms_ = millis();
-    last_checkpoint_ms_ = started_ms_;
+    last_checkpoint_ms_ = motor_idle ? started_ms_ : started_ms_ - 3600000U;
     duration_s_ = duration_hours * 3600U;
     active_ = true;
     // Keep the last completed result visible until this run succeeds.
     std::remove(CHECKPOINT);
-    ESP_LOGI("ldr_training", "Learning started for %u hour(s)", duration_hours);
+    ESP_LOGI("ldr_training", "Learning started for %" PRIu32 " hour(s)", duration_hours);
+    if (motor_idle) checkpoint();
   }
 
   void cancel() {
@@ -118,27 +125,26 @@ class Trainer {
     if (f == nullptr) return false;
     bool ok = fwrite(&cp, 1, sizeof(cp), f) == sizeof(cp) && fflush(f) == 0;
     fclose(f);
-    if (ok) { std::remove(CHECKPOINT); ok = std::rename(CHECKPOINT_TMP, CHECKPOINT) == 0; }
+    if (ok) ok = replace_safely(CHECKPOINT_TMP, CHECKPOINT, CHECKPOINT_BAK);
     if (!ok) std::remove(CHECKPOINT_TMP);
     if (ok) last_checkpoint_ms_ = millis();
     return ok;
   }
 
   bool restore() {
-    FILE *f = fopen(CHECKPOINT, "rb");
-    if (f == nullptr) return false;
-    Checkpoint cp{};
-    bool ok = fread(&cp, 1, sizeof(cp), f) == sizeof(cp);
-    fclose(f);
-    uint32_t expected = crc32(reinterpret_cast<const uint8_t *>(&cp), sizeof(cp) - sizeof(cp.crc32));
-    if (!ok || cp.magic != MAGIC || cp.version != VERSION || cp.bins != BIN_COUNT || cp.crc32 != expected || cp.elapsed_seconds >= cp.duration_seconds) {
-      ESP_LOGW("ldr_training", "Ignoring invalid or expired checkpoint");
-      return false;
+    Checkpoint cp{}, candidate{};
+    bool found = false;
+    for (const char *path : {CHECKPOINT_TMP, CHECKPOINT, CHECKPOINT_BAK}) {
+      if (read_valid_checkpoint(path, candidate) && (!found || candidate.elapsed_seconds > cp.elapsed_seconds)) {
+        cp = candidate; found = true;
+      }
     }
+    if (!found || cp.elapsed_seconds >= cp.duration_seconds) return false;
     duration_s_ = cp.duration_seconds; elapsed_before_boot_s_ = cp.elapsed_seconds;
     sample_count_ = cp.sample_count; memcpy(histogram_.data(), cp.histogram, sizeof(cp.histogram));
     started_ms_ = millis(); last_checkpoint_ms_ = started_ms_; active_ = true;
-    ESP_LOGI("ldr_training", "Restored %u samples at %.1f%%", sample_count_, progress_percent());
+    ESP_LOGI("ldr_training", "Restored %" PRIu32 " samples at %.1f%%", sample_count_, progress_percent());
+    checkpoint();
     return true;
   }
 
@@ -193,14 +199,17 @@ class Trainer {
   bool applied() const { return applied_; }
   uint32_t samples() const { return sample_count_; }
   uint32_t duration_hours() const { return duration_s_ / 3600U; }
-  float progress_percent() const { return duration_s_ ? fminf(100.0f, 100.0f * elapsed_seconds() / duration_s_) : 0.0f; }
+  float progress_percent() const {
+    if (!active_ && complete_) return 100.0f;
+    return duration_s_ ? fminf(100.0f, 100.0f * elapsed_seconds() / duration_s_) : 0.0f;
+  }
   const Result &result() const { return result_; }
 
   std::string status() const {
     char b[96];
-    if (active_) snprintf(b, sizeof(b), "LEARNING %.1f%% (%u samples)", progress_percent(), sample_count_);
-    else if (complete_ && applied_) snprintf(b, sizeof(b), "APPLIED (%u samples)", result_sample_count_);
-    else if (complete_) snprintf(b, sizeof(b), "READY TO APPLY (%u samples)", result_sample_count_);
+    if (active_) snprintf(b, sizeof(b), "LEARNING %.1f%% (%" PRIu32 " samples)", progress_percent(), sample_count_);
+    else if (complete_ && applied_) snprintf(b, sizeof(b), "APPLIED (%" PRIu32 " samples)", result_sample_count_);
+    else if (complete_) snprintf(b, sizeof(b), "READY TO APPLY (%" PRIu32 " samples)", result_sample_count_);
     else snprintf(b, sizeof(b), "IDLE");
     return b;
   }
@@ -234,14 +243,35 @@ class Trainer {
     while (len--) { crc ^= *data++; for (uint8_t i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U))); }
     return ~crc;
   }
+  static bool replace_safely(const char *temp, const char *final_path, const char *backup) {
+    std::remove(backup);
+    const bool had_final = std::rename(final_path, backup) == 0;
+    if (std::rename(temp, final_path) == 0) {
+      if (had_final) std::remove(backup);
+      return true;
+    }
+    if (had_final) std::rename(backup, final_path);
+    return false;
+  }
+  static bool read_valid_checkpoint(const char *path, Checkpoint &cp) {
+    FILE *f = fopen(path, "rb"); if (f == nullptr) return false;
+    const bool ok = fread(&cp, 1, sizeof(cp), f) == sizeof(cp); fclose(f);
+    if (!ok || cp.magic != MAGIC || cp.version != VERSION || cp.bins != BIN_COUNT) return false;
+    return cp.crc32 == crc32(reinterpret_cast<const uint8_t *>(&cp), sizeof(cp) - sizeof(cp.crc32));
+  }
+  static bool read_valid_summary(const char *path, Summary &s) {
+    FILE *f = fopen(path, "rb"); if (f == nullptr) return false;
+    const bool ok = fread(&s, 1, sizeof(s), f) == sizeof(s); fclose(f);
+    if (!ok || s.magic != MAGIC || s.version != VERSION) return false;
+    return s.crc32 == crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
+  }
   bool restore_summary() {
-    FILE *f = fopen(SUMMARY, "rb");
-    if (f == nullptr) return false;
     Summary s{};
-    bool ok = fread(&s, 1, sizeof(s), f) == sizeof(s);
-    fclose(f);
-    const uint32_t expected = crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
-    if (!ok || s.magic != MAGIC || s.version != VERSION || s.crc32 != expected) {
+    bool found = false;
+    for (const char *path : {SUMMARY_TMP, SUMMARY, SUMMARY_BAK}) {
+      if (read_valid_summary(path, s)) { found = true; break; }
+    }
+    if (!found) {
       ESP_LOGW("ldr_training", "Ignoring invalid completed-learning summary");
       return false;
     }
@@ -252,7 +282,8 @@ class Trainer {
     result_.predicted_bright_v = s.predicted_bright_v; result_.predicted_dark_v = s.predicted_dark_v;
     result_.no_secondary = s.no_secondary != 0;
     result_sample_count_ = s.sample_count; applied_ = s.applied != 0; complete_ = true;
-    ESP_LOGI("ldr_training", "Restored completed result (%u samples, %s)", result_sample_count_, applied_ ? "applied" : "not applied");
+    ESP_LOGI("ldr_training", "Restored completed result (%" PRIu32 " samples, %s)", result_sample_count_, applied_ ? "applied" : "not applied");
+    write_summary();
     return true;
   }
 
@@ -269,7 +300,8 @@ class Trainer {
     s.crc32 = crc32(reinterpret_cast<const uint8_t *>(&s), sizeof(s) - sizeof(s.crc32));
     FILE *f = fopen(SUMMARY_TMP, "wb"); if (f == nullptr) return;
     bool ok = fwrite(&s, 1, sizeof(s), f) == sizeof(s) && fflush(f) == 0; fclose(f);
-    if (ok) { std::remove(SUMMARY); std::rename(SUMMARY_TMP, SUMMARY); } else std::remove(SUMMARY_TMP);
+    if (ok) ok = replace_safely(SUMMARY_TMP, SUMMARY, SUMMARY_BAK);
+    if (!ok) std::remove(SUMMARY_TMP);
   }
 
   std::array<uint32_t, BIN_COUNT> histogram_{};
