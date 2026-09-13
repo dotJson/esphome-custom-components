@@ -7,6 +7,8 @@
 #include <cstring>
 #include <string>
 #include <type_traits>
+#include <functional>
+#include <utility>
 
 #if defined(USE_ESP32)
 #include <dirent.h>
@@ -114,6 +116,7 @@ static constexpr uint32_t K_AS5600_HUNDRED_RAW        = 0xB1000025;
 static constexpr uint32_t K_AS5600_REVERSE            = 0xB1000026;
 static constexpr uint32_t K_WEBHOOK_URL               = 0xB1000027;
 static constexpr uint32_t K_WEBHOOK_ENABLED           = 0xB1000028;
+static constexpr uint32_t K_API_VERBOSITY             = 0xB1000029;
 
 String path_for(uint32_t key);
 
@@ -143,6 +146,10 @@ bool write_history_record(FsFile &f, uint32_t timestamp, const std::string &old_
 uint16_t history_record_count(uint32_t key);
 bool append_history(uint32_t key, uint32_t timestamp, const std::string &old_value, const std::string &new_value);
 void record_change(uint32_t key, const std::string &old_value, const std::string &new_value);
+using ChangeCallback = std::function<void(uint32_t, const std::string &, const std::string &)>;
+void set_change_callback(ChangeCallback callback);
+void notify_change(uint32_t key, const std::string &old_value, const std::string &new_value);
+const char *setting_name(uint32_t key);
 void log_flash_layout();
 bool load_string(uint32_t key, std::string &value, size_t max_len = 253);
 bool save_string(uint32_t key, const std::string &value);
@@ -181,6 +188,10 @@ inline bool should_record_history(uint32_t key) {
   // Position changes and move counts are already represented by runtime
   // activity events. The position key remains a latest-value reboot snapshot;
   // the move-count key is retained only for compatibility with older YAML.
+  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT;
+}
+
+inline bool should_notify_change(uint32_t key) {
   return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT;
 }
 
@@ -226,9 +237,10 @@ inline bool save(uint32_t key, const T &value) {
   fs_remove(final_path);
   if (!fs_rename(temp_path, final_path)) return false;
 
+  const std::string old_text = had_old_value ? history_value_to_string(old_value) : std::string("<unset>");
+  const std::string new_text = history_value_to_string(value);
+  if (should_notify_change(key)) notify_change(key, old_text, new_text);
   if (should_record_history(key)) {
-    const std::string old_text = had_old_value ? history_value_to_string(old_value) : std::string("<unset>");
-    const std::string new_text = history_value_to_string(value);
     record_change(key, old_text, new_text);
   }
   return true;

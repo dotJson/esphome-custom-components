@@ -13,6 +13,61 @@
 
 namespace blind_settings {
 
+static ChangeCallback change_callback{};
+
+void set_change_callback(ChangeCallback callback) { change_callback = std::move(callback); }
+
+void notify_change(uint32_t key, const std::string &old_value, const std::string &new_value) {
+  if (change_callback) change_callback(key, old_value, new_value);
+}
+
+const char *setting_name(uint32_t key) {
+  switch (key) {
+    case K_SITE_LATITUDE: return "site_latitude";
+    case K_SITE_LONGITUDE: return "site_longitude";
+    case K_SUN_HORIZON: return "sun_horizon_elevation";
+    case K_LDR_OPEN_V: return "ldr_open_voltage";
+    case K_LDR_CLOSED_V: return "ldr_closed_voltage";
+    case K_AUTO_OPEN_POS: return "auto_open_position";
+    case K_AUTO_CLOSED_POS: return "auto_closed_position";
+    case K_LDR_SAMPLES: return "ldr_filter_samples";
+    case K_MAX_SPEED: return "stepper_maximum_speed";
+    case K_ACCEL: return "stepper_acceleration";
+    case K_DECEL: return "stepper_deceleration";
+    case K_DRIVER_IDLE: return "driver_idle_timeout";
+    case K_RUN_CURRENT: return "tmc2209_run_current";
+    case K_HOLD_CURRENT: return "tmc2209_hold_current";
+    case K_STALLGUARD: return "tmc2209_stallguard_threshold";
+    case K_OVERCURRENT: return "overcurrent_threshold";
+    case K_FULL_RANGE: return "stepper_full_range_steps";
+    case K_CAL_POSITION: return "stepper_calibration_position";
+    case K_LDR_PRESET: return "ldr_resistor_preset";
+    case K_AUTO_OPEN_MODE: return "auto_open_mode";
+    case K_TIMEZONE: return "runtime_timezone";
+    case K_NTP1: return "custom_ntp_server_1";
+    case K_NTP2: return "custom_ntp_server_2";
+    case K_NTP3: return "custom_ntp_server_3";
+    case K_OPEN_TIME: return "auto_open_time";
+    case K_CLOSE_TIME: return "auto_close_time";
+    case K_USE_CUSTOM_NTP: return "use_custom_ntp";
+    case K_AUTOMATIC_PROGRAM: return "automatic_program";
+    case K_INVERT_TILT: return "invert_tilt";
+    case K_BLIND_TILT_POSITION: return "blind_tilt_position";
+    case K_REINITIALIZE_NEXT_BOOT: return "reinitialize_next_boot";
+    case K_STEPPER_MOVE_COUNT: return "stepper_move_count";
+    case K_BLOCKED_MOVE_COUNT: return "blocked_move_count";
+    case K_OVERCURRENT_FAULT_COUNT: return "overcurrent_fault_count";
+    case K_MIGRATION_MARKER: return "littlefs_migration_marker";
+    case K_AS5600_ZERO_RAW: return "as5600_zero_raw";
+    case K_AS5600_HUNDRED_RAW: return "as5600_hundred_raw";
+    case K_AS5600_REVERSE: return "as5600_reverse";
+    case K_WEBHOOK_URL: return "activity_webhook_url";
+    case K_WEBHOOK_ENABLED: return "activity_webhook_enabled";
+    case K_API_VERBOSITY: return "api_event_verbosity";
+    default: return "unknown_setting";
+  }
+}
+
 bool ready = false;
 
 std::string vfs_path_for(const String &logical_path) {
@@ -482,7 +537,9 @@ bool save_string(uint32_t key, const std::string &value) {
   fs_remove(final_path);
   if (!fs_rename(temp_path, final_path)) return false;
 
-  record_change(key, had_old_value ? old_value : std::string("<unset>"), value);
+  const std::string old_text = had_old_value ? old_value : std::string("<unset>");
+  notify_change(key, old_text, value);
+  record_change(key, old_text, value);
   return true;
 }
 

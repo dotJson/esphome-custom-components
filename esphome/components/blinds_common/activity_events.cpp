@@ -10,6 +10,24 @@ bool active_publish = false;
 bool post_in_progress = false;
 Event active_event{};
 std::deque<Event> queue{};
+static Verbosity configured_verbosity = Verbosity::ACTIVITY;
+
+const char *verbosity_name(Verbosity verbosity) {
+  switch (verbosity) {
+    case Verbosity::ESSENTIAL: return "essential";
+    case Verbosity::ACTIVITY: return "activity";
+    case Verbosity::CHANGES: return "changes";
+    case Verbosity::DIAGNOSTIC: return "diagnostic";
+    default: return "unknown";
+  }
+}
+
+bool verbosity_allows(Verbosity configured, Verbosity event) {
+  return static_cast<uint8_t>(event) <= static_cast<uint8_t>(configured);
+}
+
+void set_verbosity(Verbosity verbosity) { configured_verbosity = verbosity; }
+Verbosity get_verbosity() { return configured_verbosity; }
 
 void copy_text(char *dest, size_t dest_size, const std::string &value) {
   if (dest_size == 0) return;
@@ -53,6 +71,41 @@ void clear_queue() { queue.clear(); }
 bool has_queued_event() { return !queue.empty(); }
 Event &front_event() { return queue.front(); }
 void pop_front() { if (!queue.empty()) queue.pop_front(); }
+
+bool queue_event(
+  Verbosity verbosity,
+  const std::string &event_type,
+  const std::string &category,
+  const std::string &source,
+  const std::string &subject,
+  const std::string &result,
+  const std::string &previous_value,
+  const std::string &value,
+  const std::string &detail,
+  bool publish_now,
+  const std::string &error
+) {
+  if (!publish_now || !verbosity_allows(configured_verbosity, verbosity)) return false;
+
+  Event event{};
+  event.boot_id = boot_id;
+  event.event_id = next_event_id();
+  event.verbosity = verbosity;
+  copy_text(event.event_type, sizeof(event.event_type), event_type);
+  copy_text(event.category, sizeof(event.category), category);
+  copy_text(event.source, sizeof(event.source), source);
+  copy_text(event.subject, sizeof(event.subject), subject);
+  copy_text(event.result, sizeof(event.result), result);
+  copy_text(event.previous_value, sizeof(event.previous_value), previous_value);
+  copy_text(event.value, sizeof(event.value), value);
+  copy_text(event.detail, sizeof(event.detail), detail);
+  copy_text(event.error, sizeof(event.error), error);
+  event.started_epoch = valid_epoch_now();
+  event.completed_epoch = event.started_epoch;
+  event.started_ms = millis();
+  enqueue(event);
+  return true;
+}
 
 void update_motion_aggregates(Event &event, float current_a, float power_w, float supply_voltage) {
   if (!std::isnan(current_a)) {
@@ -150,6 +203,9 @@ uint32_t begin_move(
   copy_text(active_event.result, sizeof(active_event.result), "in_progress");
   active_event.started_epoch = valid_epoch_now();
   active_event.started_ms = millis();
+  active_event.verbosity = Verbosity::ACTIVITY;
+  copy_text(active_event.category, sizeof(active_event.category), "motion");
+  copy_text(active_event.subject, sizeof(active_event.subject), "blind_position");
   active_event.start_position = start_position;
   active_event.target_position = target_position;
   active_event.start_steps = start_steps;
@@ -162,7 +218,7 @@ uint32_t begin_move(
   active_event.start_current_a = current_a;
   active_event.start_power_w = power_w;
   active = true;
-  active_publish = publish_now;
+  active_publish = publish_now && verbosity_allows(configured_verbosity, Verbosity::ACTIVITY);
   return new_event_id;
 }
 
@@ -172,6 +228,9 @@ void queue_boot_event(bool publish_now) {
   event.boot_id = boot_id;
   event.event_id = 1;
   copy_text(event.event_type, sizeof(event.event_type), "boot");
+  event.verbosity = Verbosity::ESSENTIAL;
+  copy_text(event.category, sizeof(event.category), "system");
+  copy_text(event.subject, sizeof(event.subject), "controller");
   copy_text(event.source, sizeof(event.source), "system");
   copy_text(event.result, sizeof(event.result), "success");
   event.started_epoch = valid_epoch_now();

@@ -90,6 +90,7 @@ class Trainer {
     last_checkpoint_ok_ = false;
     duration_s_ = duration_hours * 3600U;
     active_ = true;
+    last_finish_valid_ = false;
     // Keep the last completed result visible until this run succeeds.
     std::remove(CHECKPOINT);
     ESP_LOGI("ldr_training", "Learning started for %" PRIu32 " hour(s)", duration_hours);
@@ -164,12 +165,14 @@ class Trainer {
     active_ = false;
     Result candidate = calculate();
     if (candidate.valid) {
+      last_finish_valid_ = true;
       result_ = candidate;
       result_sample_count_ = sample_count_;
       complete_ = true;
       applied_ = false;
       write_summary();
     } else {
+      last_finish_valid_ = false;
       ESP_LOGW("ldr_training", "Learning ended without a valid range; retaining last good result");
     }
     std::remove(CHECKPOINT);
@@ -226,6 +229,7 @@ class Trainer {
   bool active() const { return active_; }
   bool complete() const { return complete_; }
   bool applied() const { return applied_; }
+  bool last_finish_valid() const { return last_finish_valid_; }
   uint32_t samples() const { return sample_count_; }
   uint32_t duration_hours() const { return duration_s_ / 3600U; }
   float progress_percent() const {
@@ -261,6 +265,8 @@ class Trainer {
     if (last_checkpoint_ms_ == 0) return NAN;
     return static_cast<float>(static_cast<uint32_t>(millis() - last_checkpoint_ms_)) / 60000.0f;
   }
+  uint32_t last_checkpoint_attempt_ms() const { return last_checkpoint_attempt_ms_; }
+  bool last_checkpoint_ok() const { return last_checkpoint_ok_; }
 
   std::string checkpoint_status() const {
     char b[64];
@@ -405,7 +411,7 @@ class Trainer {
   uint32_t sample_count_{0}, duration_s_{0}, elapsed_before_boot_s_{0}, started_ms_{0}, last_checkpoint_ms_{0};
   uint32_t last_checkpoint_attempt_ms_{0};
   uint32_t result_sample_count_{0};
-  bool active_{false}, complete_{false}, applied_{false}, last_checkpoint_ok_{false};
+  bool active_{false}, complete_{false}, applied_{false}, last_checkpoint_ok_{false}, last_finish_valid_{false};
   Result result_{};
 };
 

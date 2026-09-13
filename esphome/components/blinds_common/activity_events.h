@@ -14,7 +14,19 @@
 namespace blind_webhook {
 
 static constexpr const char *TAG = "blind_webhook";
-static constexpr size_t MAX_QUEUED_EVENTS = 8;
+static constexpr size_t MAX_QUEUED_EVENTS = 16;
+
+enum class Verbosity : uint8_t {
+  ESSENTIAL = 0,
+  ACTIVITY = 1,
+  CHANGES = 2,
+  DIAGNOSTIC = 3,
+};
+
+const char *verbosity_name(Verbosity verbosity);
+bool verbosity_allows(Verbosity configured, Verbosity event);
+void set_verbosity(Verbosity verbosity);
+Verbosity get_verbosity();
 
 struct Event {
   uint32_t boot_id{0};
@@ -23,9 +35,15 @@ struct Event {
   uint32_t superseded_by_event_id{0};
 
   char event_type[24]{};
+  char category[24]{};
   char source[40]{};
+  char subject[48]{};
   char result[40]{};
   char error[80]{};
+  char previous_value[96]{};
+  char value[96]{};
+  char detail[192]{};
+  Verbosity verbosity{Verbosity::ACTIVITY};
 
   uint32_t started_epoch{0};
   uint32_t completed_epoch{0};
@@ -89,6 +107,19 @@ void clear_queue();
 bool has_queued_event();
 Event &front_event();
 void pop_front();
+bool queue_event(
+  Verbosity verbosity,
+  const std::string &event_type,
+  const std::string &category,
+  const std::string &source,
+  const std::string &subject,
+  const std::string &result,
+  const std::string &previous_value,
+  const std::string &value,
+  const std::string &detail,
+  bool publish_now,
+  const std::string &error = ""
+);
 void update_motion_aggregates(Event &event, float current_a, float power_w, float supply_voltage);
 void sample_motion(float current_a, float power_w, float supply_voltage);
 

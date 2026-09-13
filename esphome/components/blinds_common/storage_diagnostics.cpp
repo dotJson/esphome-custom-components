@@ -161,6 +161,7 @@ const char *key_name(uint32_t key) {
     case K_AS5600_REVERSE: return "AS5600 Reverse Direction";
     case K_WEBHOOK_URL: return "Activity Webhook URL";
     case K_WEBHOOK_ENABLED: return "Activity Webhook Enable";
+    case K_API_VERBOSITY: return "API Event Verbosity";
     default: return "Unknown Setting";
   }
 }
@@ -175,6 +176,7 @@ bool is_string_key(uint32_t key) {
     case K_NTP2:
     case K_NTP3:
     case K_WEBHOOK_URL:
+    case K_API_VERBOSITY:
       return true;
     default:
       return false;
