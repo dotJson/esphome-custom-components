@@ -117,6 +117,9 @@ static constexpr uint32_t K_AS5600_REVERSE            = 0xB1000026;
 static constexpr uint32_t K_WEBHOOK_URL               = 0xB1000027;
 static constexpr uint32_t K_WEBHOOK_ENABLED           = 0xB1000028;
 static constexpr uint32_t K_API_VERBOSITY             = 0xB1000029;
+static constexpr uint32_t K_SOLAR_EXPOSURE_PROFILE    = 0xB100002A;
+static constexpr uint32_t K_SOLAR_CONTROL_MODE        = 0xB100002B;
+static constexpr uint32_t K_SOLAR_EXPOSURE_POSITION   = 0xB100002C;
 
 String path_for(uint32_t key);
 
@@ -188,11 +191,13 @@ inline bool should_record_history(uint32_t key) {
   // Position changes and move counts are already represented by runtime
   // activity events. The position key remains a latest-value reboot snapshot;
   // the move-count key is retained only for compatibility with older YAML.
-  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT;
+  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT &&
+         key != K_SOLAR_EXPOSURE_PROFILE;
 }
 
 inline bool should_notify_change(uint32_t key) {
-  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT;
+  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT &&
+         key != K_SOLAR_EXPOSURE_PROFILE;
 }
 
 template<typename T>

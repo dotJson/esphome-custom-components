@@ -162,6 +162,9 @@ const char *key_name(uint32_t key) {
     case K_WEBHOOK_URL: return "Activity Webhook URL";
     case K_WEBHOOK_ENABLED: return "Activity Webhook Enable";
     case K_API_VERBOSITY: return "API Event Verbosity";
+    case K_SOLAR_EXPOSURE_PROFILE: return "Solar Exposure Profile";
+    case K_SOLAR_CONTROL_MODE: return "Solar Exposure Control Mode";
+    case K_SOLAR_EXPOSURE_POSITION: return "Solar Exposure Position";
     default: return "Unknown Setting";
   }
 }
@@ -177,6 +180,7 @@ bool is_string_key(uint32_t key) {
     case K_NTP3:
     case K_WEBHOOK_URL:
     case K_API_VERBOSITY:
+    case K_SOLAR_CONTROL_MODE:
       return true;
     default:
       return false;

@@ -64,6 +64,9 @@ const char *setting_name(uint32_t key) {
     case K_WEBHOOK_URL: return "activity_webhook_url";
     case K_WEBHOOK_ENABLED: return "activity_webhook_enabled";
     case K_API_VERBOSITY: return "api_event_verbosity";
+    case K_SOLAR_EXPOSURE_PROFILE: return "solar_exposure_profile";
+    case K_SOLAR_CONTROL_MODE: return "solar_control_mode";
+    case K_SOLAR_EXPOSURE_POSITION: return "solar_exposure_position";
     default: return "unknown_setting";
   }
 }

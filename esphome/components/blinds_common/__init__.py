@@ -132,3 +132,4 @@ async def to_code(config):
     cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/webhook_transport.h"'))
     cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/storage_diagnostics.h"'))
     cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/ldr_training.h"'))
+    cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/solar_exposure.h"'))
