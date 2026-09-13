@@ -300,6 +300,8 @@ void raw_hex_dump(SnapshotWriter &out, const String &path) {
     }
     out.line(line);
     offset += n;
+    // Keep the low-priority snapshot worker cooperative while formatting files.
+    vTaskDelay(1);
   }
 
   if (offset == 0 && out.ok()) out.line("  <empty>");
@@ -400,6 +402,7 @@ void dump_history(SnapshotWriter &out, uint32_t key) {
     out.linef("    OLD: \"%s\"", old_value.c_str());
     out.linef("    NEW: \"%s\"", new_value.c_str());
     out.linef("    CHANGE: \"%s\" -> \"%s\"", old_value.c_str(), new_value.c_str());
+    vTaskDelay(1);
   }
 
   f.close();
@@ -680,13 +683,16 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
     while (offset < length) {
       wait_for_motor_idle();
       const size_t remaining = length - offset;
-      const size_t limit = raw_output ? HTTP_CHUNK_SIZE : 768U;
+      // ESPHome's HTTP server task has a small stack. Keep HTML escaping in a
+      // deliberately small fixed buffer; the worst case is five output bytes
+      // per input byte ("&amp;").
+      const size_t limit = raw_output ? HTTP_CHUNK_SIZE : 128U;
       const size_t n = remaining > limit ? limit : remaining;
       esp_err_t err = ESP_OK;
       if (raw_output) {
         err = httpd_resp_send_chunk(raw_request, data + offset, n);
       } else {
-        char escaped[4096];
+        char escaped[768];
         size_t written = 0;
         for (size_t i = 0; i < n; i++) {
           const char *replacement = nullptr;
