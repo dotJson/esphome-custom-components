@@ -278,6 +278,64 @@ std::string format_timestamp(uint32_t timestamp) {
   return std::string(text);
 }
 
+void dump_solar_observations(SnapshotWriter &out, const char *label,
+                             const solar_exposure::Observation *values, uint8_t used) {
+  out.linef("%s OBSERVATIONS: %u / %u", label, unsigned(used),
+            unsigned(solar_exposure::MAX_OBSERVATIONS));
+  if (used == 0) {
+    out.line("  <none captured>");
+    return;
+  }
+  for (uint8_t i = 0; i < used; i++) {
+    const auto &item = values[i];
+    const bool valid = item.day_of_year >= 1 && item.day_of_year <= 366 &&
+                       item.local_minute <= 1439 && std::isfinite(item.azimuth) &&
+                       std::isfinite(item.elevation);
+    const int gap = used == 1 ? 366 : solar_exposure::seasonal_distance(
+      item.day_of_year, values[(i + 1) % used].day_of_year);
+    const std::string captured = format_timestamp(item.epoch);
+    out.linef("  %s %u", label, unsigned(i + 1));
+    out.linef("    STATUS: %s", valid ? "valid" : "INVALID FIELD VALUE");
+    out.linef("    CAPTURED: %s", captured.c_str());
+    out.linef("    EPOCH: %lu", static_cast<unsigned long>(item.epoch));
+    out.linef("    DAY OF YEAR: %u", unsigned(item.day_of_year));
+    out.linef("    LOCAL TIME: %02u:%02u", unsigned(item.local_minute / 60),
+              unsigned(item.local_minute % 60));
+    out.linef("    SOLAR AZIMUTH: %.3f degrees", static_cast<double>(item.azimuth));
+    out.linef("    SOLAR ELEVATION: %.3f degrees", static_cast<double>(item.elevation));
+    out.linef("    SEASONAL GAP TO NEXT: %d days", gap);
+    vTaskDelay(1);
+  }
+}
+
+void dump_solar_profile(SnapshotWriter &out) {
+  solar_exposure::Profile stored{};
+  if (!blind_settings::load(blind_settings::K_SOLAR_EXPOSURE_PROFILE, stored)) {
+    out.line("CURRENT: unable to read profile or file size does not match current format");
+    return;
+  }
+  out.linef("FORMAT MAGIC: 0x%08lX (%s)", static_cast<unsigned long>(stored.magic),
+            stored.magic == solar_exposure::MAGIC ? "valid" : "INVALID");
+  out.linef("FORMAT VERSION: %u (%s)", unsigned(stored.version),
+            stored.version == solar_exposure::VERSION ? "current" : "UNSUPPORTED");
+  out.linef("PROFILE SIZE: %u bytes", unsigned(sizeof(stored)));
+  if (stored.magic != solar_exposure::MAGIC || stored.version != solar_exposure::VERSION ||
+      stored.start_count > solar_exposure::MAX_OBSERVATIONS ||
+      stored.end_count > solar_exposure::MAX_OBSERVATIONS) {
+    out.line("CURRENT: profile header validation failed; observation arrays not decoded");
+    return;
+  }
+  out.line("CURRENT: valid solar exposure profile");
+  dump_solar_observations(out, "START", stored.starts, stored.start_count);
+  dump_solar_observations(out, "END", stored.ends, stored.end_count);
+  uint32_t latest = 0;
+  for (uint8_t i = 0; i < stored.start_count; i++) latest = std::max(latest, stored.starts[i].epoch);
+  for (uint8_t i = 0; i < stored.end_count; i++) latest = std::max(latest, stored.ends[i].epoch);
+  out.linef("LATEST CAPTURE: %s", format_timestamp(latest).c_str());
+  out.line("UPDATE TRACKING: observation timestamps are stored inside this profile");
+  out.line("HISTORY POLICY: no separate metadata/history files; retained observations are the history");
+}
+
 void raw_hex_dump(SnapshotWriter &out, const String &path) {
   using namespace blind_settings;
   FsFile f = fs_open(path, "r");
@@ -311,6 +369,39 @@ void raw_hex_dump(SnapshotWriter &out, const String &path) {
 void dump_current_value(SnapshotWriter &out, uint32_t key) {
   using namespace blind_settings;
   out.linef("SETTING: %s", key_name(key));
+
+  if (key == K_SOLAR_EXPOSURE_PROFILE) {
+    dump_solar_profile(out);
+    return;
+  }
+
+  if (key == K_SOLAR_CONTROL_MODE) {
+    std::string value;
+    if (!load_string(key, value, 32)) {
+      out.line("CURRENT: unable to decode solar control mode");
+      return;
+    }
+    const bool valid = value == "Solar Only" || value == "Solar + LDR" ||
+                       value == "LDR Only" || value == "Disabled";
+    out.linef("CURRENT: \"%s\"", value.c_str());
+    out.linef("VALIDATION: %s", valid ? "recognized control mode" : "UNRECOGNIZED CONTROL MODE");
+    return;
+  }
+
+  if (key == K_SOLAR_EXPOSURE_POSITION || key == K_SOLAR_WINTER_REDUCTION) {
+    float value = 0.0f;
+    if (!load(key, value)) {
+      out.line("CURRENT: unable to decode solar position setting");
+      return;
+    }
+    if (key == K_SOLAR_EXPOSURE_POSITION)
+      out.linef("CURRENT: %.1f %% (summer solar exposure tilt)", static_cast<double>(value));
+    else
+      out.linef("CURRENT: %.1f percentage points (winter tilt reduction)", static_cast<double>(value));
+    out.linef("VALIDATION: %s", value >= 0.0f && value <= (key == K_SOLAR_EXPOSURE_POSITION ? 100.0f : 50.0f)
+      ? "within configured range" : "OUTSIDE CONFIGURED RANGE");
+    return;
+  }
 
   if (is_string_key(key)) {
     std::string value;
@@ -500,8 +591,10 @@ void stream_dump(SnapshotWriter &out) {
     out.linef("KEY: 0x%08lX", static_cast<unsigned long>(key));
     out.linef("CFG FILE: %s", name.c_str());
     dump_current_value(out, key);
-    dump_metadata(out, key);
-    dump_history(out, key);
+    if (key != K_SOLAR_EXPOSURE_PROFILE) {
+      dump_metadata(out, key);
+      dump_history(out, key);
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   cfg_dir.close();
