@@ -120,6 +120,7 @@ static constexpr uint32_t K_API_VERBOSITY             = 0xB1000029;
 static constexpr uint32_t K_SOLAR_EXPOSURE_PROFILE    = 0xB100002A;
 static constexpr uint32_t K_SOLAR_CONTROL_MODE        = 0xB100002B;
 static constexpr uint32_t K_SOLAR_EXPOSURE_POSITION   = 0xB100002C;
+static constexpr uint32_t K_SOLAR_WINTER_REDUCTION    = 0xB100002D;
 
 String path_for(uint32_t key);
 

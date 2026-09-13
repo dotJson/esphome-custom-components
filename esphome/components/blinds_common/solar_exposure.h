@@ -9,8 +9,8 @@
 namespace solar_exposure {
 
 static constexpr uint32_t MAGIC = 0x534F4C52U;
-static constexpr uint8_t VERSION = 1;
-static constexpr uint8_t MAX_OBSERVATIONS = 12;
+static constexpr uint8_t VERSION = 2;
+static constexpr uint8_t MAX_OBSERVATIONS = 48;
 enum class Boundary : uint8_t { START = 0, END = 1 };
 
 struct Observation {
@@ -62,6 +62,45 @@ inline const Observation *items(Boundary boundary) {
   return boundary == Boundary::START ? profile.starts : profile.ends;
 }
 
+inline int seasonal_distance(uint16_t a, uint16_t b) {
+  const int direct = std::abs(int(a) - int(b));
+  return std::min(direct, 366 - direct);
+}
+
+inline float angular_difference(float a, float b) {
+  float delta = std::fabs(a - b);
+  return delta > 180.0f ? 360.0f - delta : delta;
+}
+
+// Select the least valuable member of a full, sorted candidate set. A point is
+// expendable when its two seasonal neighbours are close together and it lies
+// near the curve they imply. Sharp bends receive a strong preservation bonus.
+inline uint8_t least_informative(const Observation *values, uint8_t used) {
+  uint8_t selected = 0;
+  float lowest = INFINITY;
+  for (uint8_t i = 0; i < used; i++) {
+    const Observation &previous = values[(i + used - 1) % used];
+    const Observation &current = values[i];
+    const Observation &next = values[(i + 1) % used];
+    const float left_gap = float(seasonal_distance(previous.day_of_year, current.day_of_year));
+    const float right_gap = float(seasonal_distance(current.day_of_year, next.day_of_year));
+    const float span = std::max(1.0f, left_gap + right_gap);
+    const float fraction = left_gap / span;
+    float az_delta = next.azimuth - previous.azimuth;
+    if (az_delta > 180.0f) az_delta -= 360.0f;
+    if (az_delta < -180.0f) az_delta += 360.0f;
+    const float expected_azimuth = std::fmod(previous.azimuth + fraction * az_delta + 360.0f, 360.0f);
+    const float expected_elevation = previous.elevation + fraction * (next.elevation - previous.elevation);
+    const float curve_error = angular_difference(current.azimuth, expected_azimuth) +
+                              1.5f * std::fabs(current.elevation - expected_elevation);
+    // Small neighbour gaps make a point redundant; curve error protects useful
+    // detail even when several samples happen to be close in date.
+    const float value = std::min(left_gap, right_gap) + 4.0f * curve_error;
+    if (value < lowest) { lowest = value; selected = i; }
+  }
+  return selected;
+}
+
 inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
                     float azimuth, float elevation, uint32_t epoch) {
   if (!loaded) load();
@@ -75,19 +114,32 @@ inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
   }
   if (used < MAX_OBSERVATIONS) values[used++] = observation;
   else {
-    uint8_t nearest = 0;
-    int best = 367;
-    for (uint8_t i = 0; i < used; i++) {
-      int distance = std::abs(int(values[i].day_of_year) - int(day));
-      distance = std::min(distance, 366 - distance);
-      if (distance < best) { best = distance; nearest = i; }
+    Observation candidates[MAX_OBSERVATIONS + 1];
+    std::copy(values, values + used, candidates);
+    candidates[used] = observation;
+    std::sort(candidates, candidates + used + 1, [](const Observation &a, const Observation &b) {
+      return a.day_of_year < b.day_of_year;
+    });
+    const uint8_t discard = least_informative(candidates, used + 1);
+    for (uint8_t source = 0, destination = 0; source < used + 1; source++) {
+      if (source != discard) values[destination++] = candidates[source];
     }
-    values[nearest] = observation;
   }
   std::sort(values, values + used, [](const Observation &a, const Observation &b) {
     return a.day_of_year < b.day_of_year;
   });
   return save();
+}
+
+inline float winter_factor(uint16_t day, double latitude) {
+  constexpr float PI = 3.14159265358979323846f;
+  const float winter_day = latitude < 0.0 ? 172.0f : 355.0f;
+  return 0.5f * (1.0f + std::cos(2.0f * PI * (float(day) - winter_day) / 365.2422f));
+}
+
+inline float seasonal_position(float summer_position, float winter_reduction,
+                               uint16_t day, double latitude) {
+  return std::clamp(summer_position - winter_reduction * winter_factor(day, latitude), 0.0f, 100.0f);
 }
 
 inline bool interpolate(Boundary boundary, uint16_t day, Observation &result) {

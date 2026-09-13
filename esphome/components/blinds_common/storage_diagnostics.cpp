@@ -1,5 +1,6 @@
 #include "storage_diagnostics.h"
 #include "persistent_settings.h"
+#include "solar_exposure.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 
 #if defined(USE_ESP32) && defined(USE_WEBSERVER)
@@ -23,6 +24,7 @@ namespace {
 
 static constexpr const char *TAG = "littlefs_web_dump";
 static constexpr const char *DUMP_PATH = "/littlefs";
+static constexpr const char *SOLAR_PATH = "/solar-exposure";
 static constexpr size_t SNAPSHOT_CAPACITY = 1024U * 1024U;
 static constexpr size_t HTTP_CHUNK_SIZE = 4096U;
 
@@ -165,6 +167,7 @@ const char *key_name(uint32_t key) {
     case K_SOLAR_EXPOSURE_PROFILE: return "Solar Exposure Profile";
     case K_SOLAR_CONTROL_MODE: return "Solar Exposure Control Mode";
     case K_SOLAR_EXPOSURE_POSITION: return "Solar Exposure Position";
+    case K_SOLAR_WINTER_REDUCTION: return "Solar Winter Tilt Reduction";
     default: return "Unknown Setting";
   }
 }
@@ -245,6 +248,8 @@ bool is_float_key(uint32_t key) {
     case K_OVERCURRENT:
     case K_FULL_RANGE:
     case K_CAL_POSITION:
+    case K_SOLAR_EXPOSURE_POSITION:
+    case K_SOLAR_WINTER_REDUCTION:
     case K_BLIND_TILT_POSITION:
       return true;
     default:
@@ -662,7 +667,76 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
   }
 };
 
+void append_solar_table(std::string &html, const char *title,
+                        solar_exposure::Boundary boundary) {
+  const auto *values = solar_exposure::items(boundary);
+  const uint8_t used = solar_exposure::count(boundary);
+  char row[512];
+  snprintf(row, sizeof(row), "<section><h2>%s observations <span>%u / %u</span></h2>",
+           title, unsigned(used), unsigned(solar_exposure::MAX_OBSERVATIONS));
+  html += row;
+  if (used == 0) {
+    html += "<p class=empty>No observations captured.</p></section>";
+    return;
+  }
+  html += "<table><thead><tr><th>#</th><th>Captured</th><th>Day of year</th>"
+          "<th>Local time</th><th>Azimuth</th><th>Elevation</th><th>Gap to next</th></tr></thead><tbody>";
+  for (uint8_t i = 0; i < used; i++) {
+    char captured[32] = "Unknown";
+    if (values[i].epoch != 0) {
+      const time_t epoch = time_t(values[i].epoch);
+      struct tm local{};
+      localtime_r(&epoch, &local);
+      strftime(captured, sizeof(captured), "%Y-%m-%d %H:%M", &local);
+    }
+    const int gap = used == 1 ? 366 : solar_exposure::seasonal_distance(
+      values[i].day_of_year, values[(i + 1) % used].day_of_year);
+    snprintf(row, sizeof(row),
+      "<tr><td>%u</td><td>%s</td><td>%u</td><td>%02u:%02u</td>"
+      "<td>%.2f&deg;</td><td>%.2f&deg;</td><td>%d days</td></tr>",
+      unsigned(i + 1), captured, unsigned(values[i].day_of_year),
+      unsigned(values[i].local_minute / 60), unsigned(values[i].local_minute % 60),
+      values[i].azimuth, values[i].elevation, gap);
+    html += row;
+  }
+  html += "</tbody></table></section>";
+}
+
+class SolarExposureHandler : public AsyncWebHandler {
+ public:
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    if (request == nullptr || request->method() != HTTP_GET) return false;
+    char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->url_to(url_buffer) == SOLAR_PATH;
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) override {
+    if (request == nullptr) return;
+    httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
+    if (raw_request == nullptr) return;
+    if (!solar_exposure::loaded) solar_exposure::load();
+    std::string html;
+    html.reserve(24576);
+    html += "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            "<title>Solar Exposure Observations</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}"
+            "main{max-width:1100px;margin:auto}h1{margin-bottom:4px}h2{margin-top:32px}h2 span{font-size:.65em;color:#93c5fd;font-weight:500}"
+            "p{color:#9ca3af}table{width:100%;border-collapse:collapse;background:#1f2937;border-radius:10px;overflow:hidden}"
+            "th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #374151}th{background:#374151;color:#bfdbfe}"
+            "tr:last-child td{border:0}.empty{padding:18px;background:#1f2937;border-radius:10px}@media(max-width:700px){body{padding:12px}table{font-size:12px}th,td{padding:7px}}</style>"
+            "</head><body><main><h1>Solar Exposure Observations</h1>"
+            "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>";
+    append_solar_table(html, "Window start", solar_exposure::Boundary::START);
+    append_solar_table(html, "Window end", solar_exposure::Boundary::END);
+    html += "</main></body></html>";
+    httpd_resp_set_status(raw_request, HTTPD_200);
+    httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
+    (void) httpd_resp_send(raw_request, html.data(), html.size());
+  }
+};
+
 StorageDiagnosticsHandler handler;
+SolarExposureHandler solar_handler;
 bool handler_registered = false;
 
 }  // namespace
@@ -681,8 +755,10 @@ bool register_handler() {
   }
 
   base->add_handler(&handler);
+  base->add_handler(&solar_handler);
   handler_registered = true;
   ESP_LOGI(TAG, "Registered storage diagnostics endpoint at %s", DUMP_PATH);
+  ESP_LOGI(TAG, "Registered solar exposure report at %s", SOLAR_PATH);
   return true;
 }
 
