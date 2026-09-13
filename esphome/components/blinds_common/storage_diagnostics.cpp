@@ -25,6 +25,7 @@ namespace {
 static constexpr const char *TAG = "littlefs_web_dump";
 static constexpr const char *DUMP_PATH = "/littlefs";
 static constexpr const char *SOLAR_PATH = "/solar-exposure";
+static constexpr const char *INDEX_PATH = "/index";
 static constexpr size_t SNAPSHOT_CAPACITY = 1024U * 1024U;
 static constexpr size_t HTTP_CHUNK_SIZE = 4096U;
 
@@ -723,7 +724,7 @@ class SolarExposureHandler : public AsyncWebHandler {
             "p{color:#9ca3af}table{width:100%;border-collapse:collapse;background:#1f2937;border-radius:10px;overflow:hidden}"
             "th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #374151}th{background:#374151;color:#bfdbfe}"
             "tr:last-child td{border:0}.empty{padding:18px;background:#1f2937;border-radius:10px}@media(max-width:700px){body{padding:12px}table{font-size:12px}th,td{padding:7px}}</style>"
-            "</head><body><main><h1>Solar Exposure Observations</h1>"
+            "</head><body><main><p><a href=\"/index\" style=\"color:#93c5fd\">&larr; Device pages</a></p><h1>Solar Exposure Observations</h1>"
             "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>";
     append_solar_table(html, "Window start", solar_exposure::Boundary::START);
     append_solar_table(html, "Window end", solar_exposure::Boundary::END);
@@ -735,8 +736,39 @@ class SolarExposureHandler : public AsyncWebHandler {
   }
 };
 
+class DeviceIndexHandler : public AsyncWebHandler {
+ public:
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    if (request == nullptr || request->method() != HTTP_GET) return false;
+    char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->url_to(url_buffer) == INDEX_PATH;
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) override {
+    if (request == nullptr) return;
+    httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
+    if (raw_request == nullptr) return;
+    static constexpr const char *PAGE =
+      "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>Blind Controller Pages</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}"
+      "main{max-width:760px;margin:auto}h1{margin-bottom:6px}p{color:#9ca3af}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:28px}"
+      "a{display:block;text-decoration:none;color:#e5e7eb;background:#1f2937;border:1px solid #374151;border-radius:12px;padding:20px}"
+      "a:hover{border-color:#60a5fa;background:#263449}strong{display:block;color:#bfdbfe;font-size:1.1rem;margin-bottom:7px}span{color:#9ca3af;line-height:1.4}</style></head>"
+      "<body><main><h1>Blind Controller Pages</h1><p>Local pages exposed by this controller.</p><div class=grid>"
+      "<a href=\"/\"><strong>ESPHome Controls</strong><span>Entities, settings, live states, and device controls.</span></a>"
+      "<a href=\"/solar-exposure\"><strong>Solar Exposure Records</strong><span>Read-only captured start/end observations and seasonal coverage gaps.</span></a>"
+      "<a href=\"/littlefs\"><strong>Storage Diagnostics</strong><span>Read-only persistent settings and LittleFS diagnostic snapshot.</span></a>"
+      "</div></main></body></html>";
+    httpd_resp_set_status(raw_request, HTTPD_200);
+    httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
+    (void) httpd_resp_send(raw_request, PAGE, HTTPD_RESP_USE_STRLEN);
+  }
+};
+
 StorageDiagnosticsHandler handler;
 SolarExposureHandler solar_handler;
+DeviceIndexHandler index_handler;
 bool handler_registered = false;
 
 }  // namespace
@@ -756,9 +788,11 @@ bool register_handler() {
 
   base->add_handler(&handler);
   base->add_handler(&solar_handler);
+  base->add_handler(&index_handler);
   handler_registered = true;
   ESP_LOGI(TAG, "Registered storage diagnostics endpoint at %s", DUMP_PATH);
   ESP_LOGI(TAG, "Registered solar exposure report at %s", SOLAR_PATH);
+  ESP_LOGI(TAG, "Registered device page directory at %s", INDEX_PATH);
   return true;
 }
 
