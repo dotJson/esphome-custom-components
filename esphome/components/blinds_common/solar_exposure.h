@@ -1,6 +1,5 @@
 #pragma once
 
-#include "esphome/components/blinds_common/persistent_settings.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -37,22 +36,8 @@ inline bool loaded{false};
 
 inline void reset() { profile = Profile{}; loaded = true; }
 
-inline bool load() {
-  Profile candidate{};
-  if (!blind_settings::load(blind_settings::K_SOLAR_EXPOSURE_PROFILE, candidate) ||
-      candidate.magic != MAGIC || candidate.version != VERSION ||
-      candidate.start_count > MAX_OBSERVATIONS || candidate.end_count > MAX_OBSERVATIONS) {
-    reset();
-    return false;
-  }
-  profile = candidate;
-  loaded = true;
-  return true;
-}
-
-inline bool save() {
-  return blind_settings::save(blind_settings::K_SOLAR_EXPOSURE_PROFILE, profile);
-}
+bool load();
+bool save();
 
 inline uint8_t count(Boundary boundary) {
   return boundary == Boundary::START ? profile.start_count : profile.end_count;
@@ -132,9 +117,9 @@ inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
 }
 
 inline float winter_factor(uint16_t day, double latitude) {
-  constexpr float PI = 3.14159265358979323846f;
+  constexpr float PI_VALUE = 3.14159265358979323846f;
   const float winter_day = latitude < 0.0 ? 172.0f : 355.0f;
-  return 0.5f * (1.0f + std::cos(2.0f * PI * (float(day) - winter_day) / 365.2422f));
+  return 0.5f * (1.0f + std::cos(2.0f * PI_VALUE * (float(day) - winter_day) / 365.2422f));
 }
 
 inline float seasonal_position(float summer_position, float winter_reduction,
