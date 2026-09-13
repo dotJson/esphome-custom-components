@@ -177,6 +177,13 @@ inline std::string history_value_to_string(const T &value) {
   }
 }
 
+inline bool should_record_history(uint32_t key) {
+  // Position changes and move counts are already represented by runtime
+  // activity events. The position key remains a latest-value reboot snapshot;
+  // the move-count key is retained only for compatibility with older YAML.
+  return key != K_BLIND_TILT_POSITION && key != K_STEPPER_MOVE_COUNT;
+}
+
 template<typename T>
 inline bool load(uint32_t key, T &value) {
   static_assert(std::is_trivially_copyable<T>::value, "POD required");
@@ -219,9 +226,11 @@ inline bool save(uint32_t key, const T &value) {
   fs_remove(final_path);
   if (!fs_rename(temp_path, final_path)) return false;
 
-  const std::string old_text = had_old_value ? history_value_to_string(old_value) : std::string("<unset>");
-  const std::string new_text = history_value_to_string(value);
-  record_change(key, old_text, new_text);
+  if (should_record_history(key)) {
+    const std::string old_text = had_old_value ? history_value_to_string(old_value) : std::string("<unset>");
+    const std::string new_text = history_value_to_string(value);
+    record_change(key, old_text, new_text);
+  }
   return true;
 }
 
