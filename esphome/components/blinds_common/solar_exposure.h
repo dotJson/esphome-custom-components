@@ -47,6 +47,52 @@ inline const Observation *items(Boundary boundary) {
   return boundary == Boundary::START ? profile.starts : profile.ends;
 }
 
+inline uint32_t latest_capture_epoch(Boundary boundary) {
+  const Observation *values = items(boundary);
+  const uint8_t used = count(boundary);
+  uint32_t latest = 0;
+  for (uint8_t i = 0; i < used; i++) latest = std::max(latest, values[i].epoch);
+  return latest;
+}
+
+// Report annual coverage as occupied half-month sectors. This rewards useful
+// seasonal distribution instead of treating dense consecutive captures as a
+// complete annual profile.
+inline float coverage_percent(Boundary boundary) {
+  bool occupied[24]{};
+  const Observation *values = items(boundary);
+  const uint8_t used = count(boundary);
+  uint8_t occupied_count = 0;
+  for (uint8_t i = 0; i < used; i++) {
+    const uint8_t sector = std::min<uint8_t>(23, uint16_t(values[i].day_of_year - 1U) * 24U / 366U);
+    if (!occupied[sector]) { occupied[sector] = true; occupied_count++; }
+  }
+  return 100.0f * float(occupied_count) / 24.0f;
+}
+
+// Recommend the centres of unrepresented half-month sectors, ordered from the
+// next future opportunity. Callers can present these as reminder candidates.
+inline uint8_t recommended_capture_days(Boundary boundary, uint16_t today,
+                                        uint16_t *output, uint8_t capacity) {
+  if (output == nullptr || capacity == 0) return 0;
+  bool occupied[24]{};
+  const Observation *values = items(boundary);
+  for (uint8_t i = 0; i < count(boundary); i++) {
+    const uint8_t sector = std::min<uint8_t>(23, uint16_t(values[i].day_of_year - 1U) * 24U / 366U);
+    occupied[sector] = true;
+  }
+  uint8_t written = 0;
+  const uint8_t current_sector = std::min<uint8_t>(23, uint16_t(std::max<uint16_t>(1, today) - 1U) * 24U / 366U);
+  for (uint8_t offset = 1; offset <= 24 && written < capacity; offset++) {
+    const uint8_t sector = (current_sector + offset) % 24;
+    if (occupied[sector]) continue;
+    const uint16_t begin = uint16_t((uint32_t(sector) * 366U) / 24U) + 1U;
+    const uint16_t end = uint16_t((uint32_t(sector + 1U) * 366U) / 24U);
+    output[written++] = uint16_t((uint32_t(begin) + end) / 2U);
+  }
+  return written;
+}
+
 inline int seasonal_distance(uint16_t a, uint16_t b) {
   const int direct = std::abs(int(a) - int(b));
   return std::min(direct, 366 - direct);
