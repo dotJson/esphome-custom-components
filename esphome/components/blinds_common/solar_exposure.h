@@ -116,10 +116,38 @@ inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
   return save();
 }
 
+inline float smoothstep(float value) {
+  value = std::clamp(value, 0.0f, 1.0f);
+  return value * value * (3.0f - 2.0f * value);
+}
+
 inline float winter_factor(uint16_t day, double latitude) {
-  constexpr float PI_VALUE = 3.14159265358979323846f;
-  const float winter_day = latitude < 0.0 ? 172.0f : 355.0f;
-  return 0.5f * (1.0f + std::cos(2.0f * PI_VALUE * (float(day) - winter_day) / 365.2422f));
+  // Northern-hemisphere seasonal anchors, expressed as approximate day of
+  // year: vernal equinox, summer solstice, autumnal equinox, winter solstice.
+  // Shift half a year for southern-hemisphere installations.
+  int seasonal_day = std::clamp<int>(day, 1, 366);
+  if (latitude < 0.0) {
+    seasonal_day += 182;
+    if (seasonal_day > 366) seasonal_day -= 366;
+  }
+
+  constexpr int VERNAL_EQUINOX = 79;
+  constexpr int SUMMER_SOLSTICE = 172;
+  constexpr int AUTUMNAL_EQUINOX = 266;
+  constexpr int WINTER_SOLSTICE = 355;
+
+  if (seasonal_day >= SUMMER_SOLSTICE && seasonal_day < AUTUMNAL_EQUINOX) {
+    return 0.0f;
+  }
+  if (seasonal_day >= AUTUMNAL_EQUINOX && seasonal_day < WINTER_SOLSTICE) {
+    return smoothstep(float(seasonal_day - AUTUMNAL_EQUINOX) /
+                      float(WINTER_SOLSTICE - AUTUMNAL_EQUINOX));
+  }
+  if (seasonal_day >= WINTER_SOLSTICE || seasonal_day < VERNAL_EQUINOX) {
+    return 1.0f;
+  }
+  return 1.0f - smoothstep(float(seasonal_day - VERNAL_EQUINOX) /
+                           float(SUMMER_SOLSTICE - VERNAL_EQUINOX));
 }
 
 inline float seasonal_position(float summer_position, float winter_reduction,
