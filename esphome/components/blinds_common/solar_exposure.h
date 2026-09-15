@@ -8,9 +8,9 @@
 namespace solar_exposure {
 
 static constexpr uint32_t MAGIC = 0x534F4C52U;
-static constexpr uint8_t VERSION = 2;
+static constexpr uint8_t VERSION = 3;
 static constexpr uint8_t MAX_OBSERVATIONS = 48;
-enum class Boundary : uint8_t { START = 0, END = 1 };
+enum class Boundary : uint8_t { START = 0, LIMIT = 1, RELEASE = 2 };
 
 struct Observation {
   uint16_t day_of_year{0};
@@ -24,10 +24,11 @@ struct Profile {
   uint32_t magic{MAGIC};
   uint8_t version{VERSION};
   uint8_t start_count{0};
-  uint8_t end_count{0};
-  uint8_t reserved{0};
+  uint8_t limit_count{0};
+  uint8_t release_count{0};
   Observation starts[MAX_OBSERVATIONS]{};
-  Observation ends[MAX_OBSERVATIONS]{};
+  Observation limits[MAX_OBSERVATIONS]{};
+  Observation releases[MAX_OBSERVATIONS]{};
 };
 
 static_assert(std::is_trivially_copyable<Profile>::value, "Solar profile must remain POD");
@@ -40,11 +41,13 @@ bool load();
 bool save();
 
 inline uint8_t count(Boundary boundary) {
-  return boundary == Boundary::START ? profile.start_count : profile.end_count;
+  return boundary == Boundary::START ? profile.start_count :
+         boundary == Boundary::LIMIT ? profile.limit_count : profile.release_count;
 }
 
 inline const Observation *items(Boundary boundary) {
-  return boundary == Boundary::START ? profile.starts : profile.ends;
+  return boundary == Boundary::START ? profile.starts :
+         boundary == Boundary::LIMIT ? profile.limits : profile.releases;
 }
 
 inline uint32_t latest_capture_epoch(Boundary boundary) {
@@ -137,8 +140,10 @@ inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
   if (!loaded) load();
   if (day < 1 || day > 366 || minute > 1439 ||
       !std::isfinite(azimuth) || !std::isfinite(elevation)) return false;
-  Observation *values = boundary == Boundary::START ? profile.starts : profile.ends;
-  uint8_t &used = boundary == Boundary::START ? profile.start_count : profile.end_count;
+  Observation *values = boundary == Boundary::START ? profile.starts :
+                        boundary == Boundary::LIMIT ? profile.limits : profile.releases;
+  uint8_t &used = boundary == Boundary::START ? profile.start_count :
+                  boundary == Boundary::LIMIT ? profile.limit_count : profile.release_count;
   const Observation observation{day, minute, azimuth, elevation, epoch};
   for (uint8_t i = 0; i < used; i++) {
     if (values[i].day_of_year == day) { values[i] = observation; return save(); }
@@ -293,10 +298,16 @@ inline bool predicted_minutes(Boundary boundary, uint16_t day, uint32_t local_mi
 
 inline bool window_for_day(uint16_t day, uint32_t local_midnight_epoch,
                            double latitude, double longitude,
-                           uint16_t &start, uint16_t &end) {
-  return predicted_minutes(Boundary::START, day, local_midnight_epoch, latitude, longitude, start) &&
-         predicted_minutes(Boundary::END, day, local_midnight_epoch, latitude, longitude, end) &&
-         start < end;
+                           uint16_t &start, uint16_t &limit, uint16_t &release) {
+  if (!predicted_minutes(Boundary::START, day, local_midnight_epoch, latitude, longitude, start) ||
+      !predicted_minutes(Boundary::RELEASE, day, local_midnight_epoch, latitude, longitude, release) ||
+      start >= release) return false;
+  if (!predicted_minutes(Boundary::LIMIT, day, local_midnight_epoch, latitude, longitude, limit)) {
+    // Safe provisional behaviour for migrated profiles: reach the configured
+    // limit one quarter of the way through the learned exposure window.
+    limit = uint16_t(start + std::max<uint16_t>(1, uint16_t((release - start) / 4U)));
+  }
+  return start < limit && limit < release;
 }
 
 }  // namespace solar_exposure

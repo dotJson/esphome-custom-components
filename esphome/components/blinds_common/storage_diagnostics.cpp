@@ -321,16 +321,19 @@ void dump_solar_profile(SnapshotWriter &out) {
   out.linef("PROFILE SIZE: %u bytes", unsigned(sizeof(stored)));
   if (stored.magic != solar_exposure::MAGIC || stored.version != solar_exposure::VERSION ||
       stored.start_count > solar_exposure::MAX_OBSERVATIONS ||
-      stored.end_count > solar_exposure::MAX_OBSERVATIONS) {
+      stored.limit_count > solar_exposure::MAX_OBSERVATIONS ||
+      stored.release_count > solar_exposure::MAX_OBSERVATIONS) {
     out.line("CURRENT: profile header validation failed; observation arrays not decoded");
     return;
   }
   out.line("CURRENT: valid solar exposure profile");
   dump_solar_observations(out, "START", stored.starts, stored.start_count);
-  dump_solar_observations(out, "END", stored.ends, stored.end_count);
+  dump_solar_observations(out, "LIMIT", stored.limits, stored.limit_count);
+  dump_solar_observations(out, "RELEASE", stored.releases, stored.release_count);
   uint32_t latest = 0;
   for (uint8_t i = 0; i < stored.start_count; i++) latest = std::max(latest, stored.starts[i].epoch);
-  for (uint8_t i = 0; i < stored.end_count; i++) latest = std::max(latest, stored.ends[i].epoch);
+  for (uint8_t i = 0; i < stored.limit_count; i++) latest = std::max(latest, stored.limits[i].epoch);
+  for (uint8_t i = 0; i < stored.release_count; i++) latest = std::max(latest, stored.releases[i].epoch);
   out.linef("LATEST CAPTURE: %s", format_timestamp(latest).c_str());
   out.line("UPDATE TRACKING: observation timestamps are stored inside this profile");
   out.line("HISTORY POLICY: no separate metadata/history files; retained observations are the history");
@@ -884,8 +887,9 @@ class SolarExposureHandler : public AsyncWebHandler {
     html += "h2 span{font-size:.65em;color:#93c5fd;font-weight:500}</style>"
             "</head><body><main><a class=nav href=\"/index\">&larr; Device pages</a><h1>Solar Exposure Observations</h1>"
             "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>";
-    append_solar_table(html, "Window start", solar_exposure::Boundary::START);
-    append_solar_table(html, "Window end", solar_exposure::Boundary::END);
+    append_solar_table(html, "Exposure begin", solar_exposure::Boundary::START);
+    append_solar_table(html, "Tilt limit", solar_exposure::Boundary::LIMIT);
+    append_solar_table(html, "Exposure release", solar_exposure::Boundary::RELEASE);
     html += "</main></body></html>";
     httpd_resp_set_status(raw_request, HTTPD_200);
     httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
