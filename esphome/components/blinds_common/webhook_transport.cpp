@@ -1,6 +1,8 @@
 #include "webhook_transport.h"
 
 #include <new>
+#include <cstring>
+#include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -14,7 +16,7 @@ bool Transport::busy() const {
   return busy_.load(std::memory_order_acquire);
 }
 
-bool Transport::submit(const std::string &url, const std::string &body, bool sample) {
+bool Transport::submit(const std::string &url, const char *body, size_t body_size, bool sample) {
   bool expected = false;
   if (!busy_.compare_exchange_strong(
         expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -22,8 +24,22 @@ bool Transport::submit(const std::string &url, const std::string &body, bool sam
   }
 
   result_ready_.store(false, std::memory_order_release);
-  auto *job = new (std::nothrow) Job{this, url, body, sample};
+  char *body_copy = static_cast<char *>(
+    heap_caps_malloc(body_size + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (body_copy == nullptr) {
+    body_copy = static_cast<char *>(
+      heap_caps_malloc(body_size + 1U, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+  if (body_copy == nullptr) {
+    busy_.store(false, std::memory_order_release);
+    return false;
+  }
+  if (body_size > 0 && body != nullptr) memcpy(body_copy, body, body_size);
+  body_copy[body_size] = '\0';
+
+  auto *job = new (std::nothrow) Job{this, url, body_copy, body_size, sample};
   if (job == nullptr) {
+    heap_caps_free(body_copy);
     busy_.store(false, std::memory_order_release);
     return false;
   }
@@ -33,6 +49,7 @@ bool Transport::submit(const std::string &url, const std::string &body, bool sam
     &Transport::task_entry_, "webhook_post", 8192, job, 1, &handle);
 
   if (created != pdPASS) {
+    heap_caps_free(job->body);
     delete job;
     busy_.store(false, std::memory_order_release);
     return false;
@@ -71,7 +88,7 @@ void Transport::task_entry_(void *arg) {
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(
-      client, job->body.c_str(), static_cast<int>(job->body.size()));
+      client, job->body, static_cast<int>(job->body_size));
     err = esp_http_client_perform(client);
     if (err == ESP_OK) status_code = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
@@ -86,6 +103,7 @@ void Transport::task_entry_(void *arg) {
   self->result_duration_ms_.store(duration_ms, std::memory_order_release);
   self->result_error_.store(static_cast<int>(err), std::memory_order_release);
 
+  heap_caps_free(job->body);
   delete job;
   self->result_ready_.store(true, std::memory_order_release);
   vTaskDelete(nullptr);

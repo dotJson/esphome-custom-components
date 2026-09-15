@@ -29,6 +29,7 @@ static constexpr const char *SOLAR_PATH = "/solar-exposure";
 static constexpr const char *INDEX_PATH = "/index";
 static constexpr size_t SNAPSHOT_CAPACITY = 1024U * 1024U;
 static constexpr size_t HTTP_CHUNK_SIZE = 4096U;
+static constexpr size_t SOLAR_PAGE_CAPACITY = 64U * 1024U;
 static constexpr const char *SHARED_STYLE =
   "body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}"
   "main{max-width:1100px;margin:auto}h1{margin-bottom:6px}h2{margin-top:32px}p{color:#9ca3af;line-height:1.5}"
@@ -831,20 +832,62 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
   }
 };
 
-void append_solar_table(std::string &html, const char *title,
-                        solar_exposure::Boundary boundary) {
+class PsramPageWriter {
+ public:
+  PsramPageWriter(char *buffer, size_t capacity) : buffer_(buffer), capacity_(capacity) {
+    if (buffer_ != nullptr && capacity_ > 0) buffer_[0] = '\0';
+  }
+
+  bool write(const char *text) {
+    if (!ok_ || text == nullptr) return false;
+    const size_t length = strlen(text);
+    if (length >= capacity_ - used_) {
+      ok_ = false;
+      return false;
+    }
+    memcpy(buffer_ + used_, text, length);
+    used_ += length;
+    buffer_[used_] = '\0';
+    return true;
+  }
+
+  bool writef(const char *format, ...) {
+    if (!ok_ || format == nullptr) return false;
+    va_list args;
+    va_start(args, format);
+    const int written = vsnprintf(buffer_ + used_, capacity_ - used_, format, args);
+    va_end(args);
+    if (written < 0 || static_cast<size_t>(written) >= capacity_ - used_) {
+      ok_ = false;
+      return false;
+    }
+    used_ += static_cast<size_t>(written);
+    return true;
+  }
+
+  bool ok() const { return ok_; }
+  const char *data() const { return buffer_; }
+  size_t size() const { return used_; }
+
+ private:
+  char *buffer_{nullptr};
+  size_t capacity_{0};
+  size_t used_{0};
+  bool ok_{true};
+};
+
+void append_solar_table(PsramPageWriter &html, const char *title,
+                         solar_exposure::Boundary boundary) {
   const auto *values = solar_exposure::items(boundary);
   const uint8_t used = solar_exposure::count(boundary);
-  char row[512];
-  snprintf(row, sizeof(row), "<section><h2>%s observations <span>%u / %u</span></h2>",
-           title, unsigned(used), unsigned(solar_exposure::MAX_OBSERVATIONS));
-  html += row;
+  html.writef("<section><h2>%s observations <span>%u / %u</span></h2>",
+              title, unsigned(used), unsigned(solar_exposure::MAX_OBSERVATIONS));
   if (used == 0) {
-    html += "<p class=empty>No observations captured.</p></section>";
+    html.write("<p class=empty>No observations captured.</p></section>");
     return;
   }
-  html += "<table><thead><tr><th>#</th><th>Captured</th><th>Day of year</th>"
-          "<th>Local time</th><th>Azimuth</th><th>Elevation</th><th>Gap to next</th></tr></thead><tbody>";
+  html.write("<table><thead><tr><th>#</th><th>Captured</th><th>Day of year</th>"
+             "<th>Local time</th><th>Azimuth</th><th>Elevation</th><th>Gap to next</th></tr></thead><tbody>");
   for (uint8_t i = 0; i < used; i++) {
     char captured[32] = "Unknown";
     if (values[i].epoch != 0) {
@@ -855,15 +898,14 @@ void append_solar_table(std::string &html, const char *title,
     }
     const int gap = used == 1 ? 366 : solar_exposure::seasonal_distance(
       values[i].day_of_year, values[(i + 1) % used].day_of_year);
-    snprintf(row, sizeof(row),
+    html.writef(
       "<tr><td>%u</td><td>%s</td><td>%u</td><td>%02u:%02u</td>"
       "<td>%.2f&deg;</td><td>%.2f&deg;</td><td>%d days</td></tr>",
       unsigned(i + 1), captured, unsigned(values[i].day_of_year),
       unsigned(values[i].local_minute / 60), unsigned(values[i].local_minute % 60),
       values[i].azimuth, values[i].elevation, gap);
-    html += row;
   }
-  html += "</tbody></table></section>";
+  html.write("</tbody></table></section>");
 }
 
 class SolarExposureHandler : public AsyncWebHandler {
@@ -879,22 +921,35 @@ class SolarExposureHandler : public AsyncWebHandler {
     httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
     if (raw_request == nullptr) return;
     if (!solar_exposure::loaded) solar_exposure::load();
-    std::string html;
-    html.reserve(24576);
-    html += "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
-            "<title>Solar Exposure Observations</title><style>";
-    html += SHARED_STYLE;
-    html += "h2 span{font-size:.65em;color:#93c5fd;font-weight:500}</style>"
-            "</head><body><main><a class=nav href=\"/index\">&larr; Device pages</a><h1>Solar Exposure Observations</h1>"
-            "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>";
+    char *page_buffer = static_cast<char *>(
+      heap_caps_malloc(SOLAR_PAGE_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (page_buffer == nullptr) {
+      ESP_LOGE(TAG, "Could not allocate solar report PSRAM buffer");
+      httpd_resp_send_err(raw_request, HTTPD_500_INTERNAL_SERVER_ERROR, "Solar report memory unavailable");
+      return;
+    }
+    PsramPageWriter html(page_buffer, SOLAR_PAGE_CAPACITY);
+    html.write("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+               "<title>Solar Exposure Observations</title><style>");
+    html.write(SHARED_STYLE);
+    html.write("h2 span{font-size:.65em;color:#93c5fd;font-weight:500}</style>"
+               "</head><body><main><a class=nav href=\"/index\">&larr; Device pages</a><h1>Solar Exposure Observations</h1>"
+               "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>");
     append_solar_table(html, "Exposure begin", solar_exposure::Boundary::START);
     append_solar_table(html, "Tilt limit", solar_exposure::Boundary::LIMIT);
     append_solar_table(html, "Exposure release", solar_exposure::Boundary::RELEASE);
-    html += "</main></body></html>";
+    html.write("</main></body></html>");
+    if (!html.ok()) {
+      heap_caps_free(page_buffer);
+      ESP_LOGE(TAG, "Solar report exceeded PSRAM page buffer");
+      httpd_resp_send_err(raw_request, HTTPD_500_INTERNAL_SERVER_ERROR, "Solar report exceeded buffer");
+      return;
+    }
     httpd_resp_set_status(raw_request, HTTPD_200);
     httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
     httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
     (void) httpd_resp_send(raw_request, html.data(), html.size());
+    heap_caps_free(page_buffer);
   }
 };
 

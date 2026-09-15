@@ -3,6 +3,7 @@
 // Asynchronous HTTP POST transport for webhook delivery.
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <esp_err.h>
@@ -20,14 +21,15 @@ struct Result {
 class Transport {
  public:
   bool busy() const;
-  bool submit(const std::string &url, const std::string &body, bool sample);
+  bool submit(const std::string &url, const char *body, size_t body_size, bool sample);
   bool consume_result(Result &out);
 
  private:
   struct Job {
     Transport *owner;
     std::string url;
-    std::string body;
+    char *body;
+    size_t body_size;
     bool sample;
   };
 
