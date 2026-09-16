@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import subprocess
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -46,6 +47,42 @@ def _load_timezone_map():
 def _cpp_string(value):
     # JSON string escaping is valid for these ASCII C++ string literals.
     return json.dumps(value, ensure_ascii=True)
+
+
+def _git_value(*args):
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _component_build_cpp():
+    repository = _git_value("config", "--get", "remote.origin.url")
+    if repository.startswith("https://github.com/"):
+        repository = repository[len("https://github.com/"):]
+    elif repository.startswith("git@github.com:"):
+        repository = repository[len("git@github.com:"):]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+
+    ref = _git_value("symbolic-ref", "--short", "HEAD")
+    if ref == "unknown":
+        ref = _git_value("name-rev", "--name-only", "--no-undefined", "HEAD")
+
+    return f'''namespace blinds_common_build {{
+inline constexpr const char *COMPONENT_GIT_REPOSITORY = {_cpp_string(repository)};
+inline constexpr const char *COMPONENT_GIT_REF = {_cpp_string(ref)};
+inline constexpr const char *COMPONENT_GIT_COMMIT_HEAD = {_cpp_string(_git_value("rev-parse", "--short=8", "HEAD"))};
+inline constexpr const char *COMPONENT_GIT_COMMIT_TIME = {_cpp_string(_git_value("show", "-s", "--format=%ci", "HEAD"))};
+}}  // namespace blinds_common_build
+'''
 
 
 def _timezone_lookup_cpp(entries):
@@ -125,6 +162,7 @@ async def to_code(config):
     # JSON and never needs network access to change its runtime timezone.
     timezone_entries = _load_timezone_map()
     cg.add_global(cg.RawStatement(_timezone_lookup_cpp(timezone_entries)))
+    cg.add_global(cg.RawStatement(_component_build_cpp()))
 
     # Expose the component's public interfaces to generated YAML lambdas.
     cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/persistent_settings.h"'))
