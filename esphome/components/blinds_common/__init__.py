@@ -10,7 +10,13 @@ from esphome.components.esp32 import add_extra_build_file, include_builtin_idf_c
 CODEOWNERS = ["@dotJson"]
 DEPENDENCIES = ["esp32"]
 
-CONFIG_SCHEMA = cv.Schema({})
+CONF_GIT_REF = "git_ref"
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_GIT_REF, default="unknown"): cv.string_strict,
+    }
+)
 
 PARTITION_CSV = "partitions_esp32s3_n8_flash_map.csv"
 TIMEZONE_JSON = "timezones_iana_to_posix.json"
@@ -63,7 +69,7 @@ def _git_value(*args):
         return "unknown"
 
 
-def _component_build_cpp():
+def _component_build_cpp(configured_ref):
     repository = _git_value("config", "--get", "remote.origin.url")
     if repository.startswith("https://github.com/"):
         repository = repository[len("https://github.com/"):]
@@ -72,13 +78,9 @@ def _component_build_cpp():
     if repository.endswith(".git"):
         repository = repository[:-4]
 
-    ref = _git_value("symbolic-ref", "--short", "HEAD")
-    if ref == "unknown":
-        ref = _git_value("name-rev", "--name-only", "--no-undefined", "HEAD")
-
     return f'''namespace blinds_common_build {{
 inline constexpr const char *COMPONENT_GIT_REPOSITORY = {_cpp_string(repository)};
-inline constexpr const char *COMPONENT_GIT_REF = {_cpp_string(ref)};
+inline constexpr const char *COMPONENT_GIT_REF = {_cpp_string(configured_ref)};
 inline constexpr const char *COMPONENT_GIT_COMMIT_HEAD = {_cpp_string(_git_value("rev-parse", "--short=8", "HEAD"))};
 inline constexpr const char *COMPONENT_GIT_COMMIT_TIME = {_cpp_string(_git_value("show", "-s", "--format=%ci", "HEAD"))};
 }}  // namespace blinds_common_build
@@ -162,7 +164,7 @@ async def to_code(config):
     # JSON and never needs network access to change its runtime timezone.
     timezone_entries = _load_timezone_map()
     cg.add_global(cg.RawStatement(_timezone_lookup_cpp(timezone_entries)))
-    cg.add_global(cg.RawStatement(_component_build_cpp()))
+    cg.add_global(cg.RawStatement(_component_build_cpp(config[CONF_GIT_REF])))
 
     # Expose the component's public interfaces to generated YAML lambdas.
     cg.add_global(cg.RawStatement('#include "esphome/components/blinds_common/persistent_settings.h"'))
