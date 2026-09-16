@@ -67,7 +67,7 @@ const char *setting_name(uint32_t key) {
     case K_SOLAR_EXPOSURE_PROFILE: return "solar_exposure_profile";
     case K_SOLAR_CONTROL_MODE: return "solar_control_mode";
     case K_SOLAR_EXPOSURE_POSITION: return "solar_exposure_position";
-    case K_SOLAR_WINTER_REDUCTION: return "solar_winter_reduction";
+    case K_SOLAR_WINTER_REDUCTION: return "solar_winter_tilt_offset";
     default: return "unknown_setting";
   }
 }

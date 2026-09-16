@@ -282,9 +282,17 @@ inline float winter_factor(uint16_t day, double latitude) {
                            float(SUMMER_SOLSTICE - VERNAL_EQUINOX));
 }
 
-inline float seasonal_position(float summer_position, float winter_reduction,
+inline float seasonal_position(float solar_position, float open_position, float winter_offset,
                                uint16_t day, double latitude) {
-  return std::clamp(summer_position - winter_reduction * winter_factor(day, latitude), 0.0f, 100.0f);
+  solar_position = std::clamp(solar_position, 0.0f, 100.0f);
+  open_position = std::clamp(open_position, 0.0f, 100.0f);
+  const float distance_to_open = std::fabs(open_position - solar_position);
+  const float adjustment = std::min(
+      distance_to_open,
+      std::max(0.0f, winter_offset) * winter_factor(day, latitude));
+  if (solar_position < open_position) return solar_position + adjustment;
+  if (solar_position > open_position) return solar_position - adjustment;
+  return solar_position;
 }
 
 inline bool interpolate(Boundary boundary, uint16_t day, Observation &result) {
