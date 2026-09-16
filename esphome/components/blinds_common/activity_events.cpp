@@ -237,7 +237,11 @@ void queue_boot_event(bool publish_now) {
   event.completed_epoch = event.started_epoch;
   event.started_ms = 0;
   event.duration_ms = 0;
-  enqueue(event);
+  // Event 1 is the causal root of every session. Settings restoration may
+  // discover the webhook after other events have already been staged, so put
+  // Boot at the head rather than allowing its reserved ID to arrive late.
+  if (queue.size() >= MAX_QUEUED_EVENTS) queue.pop_back();
+  queue.push_front(event);
   boot_event_queued = true;
 }
 
