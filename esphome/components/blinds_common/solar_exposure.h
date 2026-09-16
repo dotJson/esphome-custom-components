@@ -11,6 +11,7 @@ static constexpr uint32_t MAGIC = 0x534F4C52U;
 static constexpr uint8_t VERSION = 3;
 static constexpr uint8_t MAX_OBSERVATIONS = 48;
 enum class Boundary : uint8_t { START = 0, LIMIT = 1, RELEASE = 2 };
+enum class CapturePhase : uint8_t { IDLE = 0, BEGIN_CAPTURED = 1, LIMIT_CAPTURED = 2 };
 
 struct Observation {
   uint16_t day_of_year{0};
@@ -34,6 +35,12 @@ struct Profile {
 static_assert(std::is_trivially_copyable<Profile>::value, "Solar profile must remain POD");
 inline Profile profile{};
 inline bool loaded{false};
+struct PendingCapture {
+  CapturePhase phase{CapturePhase::IDLE};
+  Observation begin{};
+  Observation limit{};
+};
+inline PendingCapture pending_capture{};
 
 inline void reset() { profile = Profile{}; loaded = true; }
 
@@ -165,6 +172,80 @@ inline bool capture(Boundary boundary, uint16_t day, uint16_t minute,
     return a.day_of_year < b.day_of_year;
   });
   return save();
+}
+
+inline void cancel_pending_capture() { pending_capture = PendingCapture{}; }
+
+inline CapturePhase capture_phase(uint16_t today) {
+  if (pending_capture.phase != CapturePhase::IDLE &&
+      pending_capture.begin.day_of_year != today) cancel_pending_capture();
+  return pending_capture.phase;
+}
+
+inline bool begin_capture(uint16_t day, uint16_t minute, float azimuth,
+                          float elevation, uint32_t epoch) {
+  if (day < 1 || day > 366 || minute > 1439 ||
+      !std::isfinite(azimuth) || !std::isfinite(elevation)) return false;
+  pending_capture = PendingCapture{};
+  pending_capture.begin = Observation{day, minute, azimuth, elevation, epoch};
+  pending_capture.phase = CapturePhase::BEGIN_CAPTURED;
+  return true;
+}
+
+inline bool capture_limit(uint16_t day, uint16_t minute, float azimuth,
+                          float elevation, uint32_t epoch) {
+  if (capture_phase(day) != CapturePhase::BEGIN_CAPTURED ||
+      minute <= pending_capture.begin.local_minute || minute > 1439 ||
+      !std::isfinite(azimuth) || !std::isfinite(elevation)) return false;
+  pending_capture.limit = Observation{day, minute, azimuth, elevation, epoch};
+  pending_capture.phase = CapturePhase::LIMIT_CAPTURED;
+  return true;
+}
+
+inline bool finish_capture(uint16_t day, uint16_t minute, float azimuth,
+                           float elevation, uint32_t epoch) {
+  if (capture_phase(day) != CapturePhase::LIMIT_CAPTURED ||
+      minute <= pending_capture.limit.local_minute || minute > 1439 ||
+      !std::isfinite(azimuth) || !std::isfinite(elevation)) return false;
+  const Observation release{day, minute, azimuth, elevation, epoch};
+  const Observation begin = pending_capture.begin;
+  const Observation limit = pending_capture.limit;
+
+  // Stage all three boundaries in RAM and persist the completed set once.
+  // capture() is deliberately not used here because it saves each boundary.
+  auto insert = [](Boundary boundary, const Observation &observation) {
+    Observation *values = boundary == Boundary::START ? profile.starts :
+                          boundary == Boundary::LIMIT ? profile.limits : profile.releases;
+    uint8_t &used = boundary == Boundary::START ? profile.start_count :
+                    boundary == Boundary::LIMIT ? profile.limit_count : profile.release_count;
+    for (uint8_t i = 0; i < used; i++) {
+      if (values[i].day_of_year == observation.day_of_year) {
+        values[i] = observation;
+        return;
+      }
+    }
+    if (used < MAX_OBSERVATIONS) values[used++] = observation;
+    else {
+      Observation candidates[MAX_OBSERVATIONS + 1];
+      std::copy(values, values + used, candidates);
+      candidates[used] = observation;
+      std::sort(candidates, candidates + used + 1, [](const Observation &a, const Observation &b) {
+        return a.day_of_year < b.day_of_year;
+      });
+      const uint8_t discard = least_informative(candidates, used + 1);
+      for (uint8_t source = 0, destination = 0; source < used + 1; source++)
+        if (source != discard) values[destination++] = candidates[source];
+    }
+    std::sort(values, values + used, [](const Observation &a, const Observation &b) {
+      return a.day_of_year < b.day_of_year;
+    });
+  };
+  insert(Boundary::START, begin);
+  insert(Boundary::LIMIT, limit);
+  insert(Boundary::RELEASE, release);
+  if (!save()) return false;
+  cancel_pending_capture();
+  return true;
 }
 
 inline float smoothstep(float value) {
