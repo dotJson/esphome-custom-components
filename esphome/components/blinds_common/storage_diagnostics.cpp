@@ -1,5 +1,6 @@
 #include "storage_diagnostics.h"
 #include "persistent_settings.h"
+#include "solar_exposure.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 
 #if defined(USE_ESP32) && defined(USE_WEBSERVER)
@@ -23,8 +24,21 @@ namespace {
 
 static constexpr const char *TAG = "littlefs_web_dump";
 static constexpr const char *DUMP_PATH = "/littlefs";
+static constexpr const char *DUMP_RAW_PATH = "/littlefs.txt";
+static constexpr const char *SOLAR_PATH = "/solar-exposure";
+static constexpr const char *INDEX_PATH = "/index";
 static constexpr size_t SNAPSHOT_CAPACITY = 1024U * 1024U;
 static constexpr size_t HTTP_CHUNK_SIZE = 4096U;
+static constexpr size_t SOLAR_PAGE_CAPACITY = 64U * 1024U;
+static constexpr const char *SHARED_STYLE =
+  "body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}"
+  "main{max-width:1100px;margin:auto}h1{margin-bottom:6px}h2{margin-top:32px}p{color:#9ca3af;line-height:1.5}"
+  ".nav{color:#93c5fd;text-decoration:none}.nav:hover{text-decoration:underline}"
+  ".card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:20px}"
+  "table{width:100%;border-collapse:collapse;background:#1f2937;border-radius:10px;overflow:hidden}"
+  "th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #374151}th{background:#374151;color:#bfdbfe}"
+  "tr:last-child td{border:0}.empty{padding:18px;background:#1f2937;border-radius:10px}"
+  "@media(max-width:700px){body{padding:12px}table{font-size:12px}th,td{padding:7px}}";
 
 std::atomic<MotionQuery> motion_query{nullptr};
 std::atomic<bool> snapshot_building{false};
@@ -162,6 +176,10 @@ const char *key_name(uint32_t key) {
     case K_WEBHOOK_URL: return "Activity Webhook URL";
     case K_WEBHOOK_ENABLED: return "Activity Webhook Enable";
     case K_API_VERBOSITY: return "API Event Verbosity";
+    case K_SOLAR_EXPOSURE_PROFILE: return "Solar Exposure Profile";
+    case K_SOLAR_CONTROL_MODE: return "Solar Exposure Control Mode";
+    case K_SOLAR_EXPOSURE_POSITION: return "Solar Exposure Position";
+    case K_SOLAR_WINTER_REDUCTION: return "Solar Winter Tilt Offset";
     default: return "Unknown Setting";
   }
 }
@@ -177,6 +195,7 @@ bool is_string_key(uint32_t key) {
     case K_NTP3:
     case K_WEBHOOK_URL:
     case K_API_VERBOSITY:
+    case K_SOLAR_CONTROL_MODE:
       return true;
     default:
       return false;
@@ -241,6 +260,8 @@ bool is_float_key(uint32_t key) {
     case K_OVERCURRENT:
     case K_FULL_RANGE:
     case K_CAL_POSITION:
+    case K_SOLAR_EXPOSURE_POSITION:
+    case K_SOLAR_WINTER_REDUCTION:
     case K_BLIND_TILT_POSITION:
       return true;
     default:
@@ -256,6 +277,67 @@ std::string format_timestamp(uint32_t timestamp) {
   char text[48];
   strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S %Z %z", &t);
   return std::string(text);
+}
+
+void dump_solar_observations(SnapshotWriter &out, const char *label,
+                             const solar_exposure::Observation *values, uint8_t used) {
+  out.linef("%s OBSERVATIONS: %u / %u", label, unsigned(used),
+            unsigned(solar_exposure::MAX_OBSERVATIONS));
+  if (used == 0) {
+    out.line("  <none captured>");
+    return;
+  }
+  for (uint8_t i = 0; i < used; i++) {
+    const auto &item = values[i];
+    const bool valid = item.day_of_year >= 1 && item.day_of_year <= 366 &&
+                       item.local_minute <= 1439 && std::isfinite(item.azimuth) &&
+                       std::isfinite(item.elevation);
+    const int gap = used == 1 ? 366 : solar_exposure::seasonal_distance(
+      item.day_of_year, values[(i + 1) % used].day_of_year);
+    const std::string captured = format_timestamp(item.epoch);
+    out.linef("  %s %u", label, unsigned(i + 1));
+    out.linef("    STATUS: %s", valid ? "valid" : "INVALID FIELD VALUE");
+    out.linef("    CAPTURED: %s", captured.c_str());
+    out.linef("    EPOCH: %lu", static_cast<unsigned long>(item.epoch));
+    out.linef("    DAY OF YEAR: %u", unsigned(item.day_of_year));
+    out.linef("    LOCAL TIME: %02u:%02u", unsigned(item.local_minute / 60),
+              unsigned(item.local_minute % 60));
+    out.linef("    SOLAR AZIMUTH: %.3f degrees", static_cast<double>(item.azimuth));
+    out.linef("    SOLAR ELEVATION: %.3f degrees", static_cast<double>(item.elevation));
+    out.linef("    SEASONAL GAP TO NEXT: %d days", gap);
+    vTaskDelay(1);
+  }
+}
+
+void dump_solar_profile(SnapshotWriter &out) {
+  solar_exposure::Profile stored{};
+  if (!blind_settings::load(blind_settings::K_SOLAR_EXPOSURE_PROFILE, stored)) {
+    out.line("CURRENT: unable to read profile or file size does not match current format");
+    return;
+  }
+  out.linef("FORMAT MAGIC: 0x%08lX (%s)", static_cast<unsigned long>(stored.magic),
+            stored.magic == solar_exposure::MAGIC ? "valid" : "INVALID");
+  out.linef("FORMAT VERSION: %u (%s)", unsigned(stored.version),
+            stored.version == solar_exposure::VERSION ? "current" : "UNSUPPORTED");
+  out.linef("PROFILE SIZE: %u bytes", unsigned(sizeof(stored)));
+  if (stored.magic != solar_exposure::MAGIC || stored.version != solar_exposure::VERSION ||
+      stored.start_count > solar_exposure::MAX_OBSERVATIONS ||
+      stored.limit_count > solar_exposure::MAX_OBSERVATIONS ||
+      stored.release_count > solar_exposure::MAX_OBSERVATIONS) {
+    out.line("CURRENT: profile header validation failed; observation arrays not decoded");
+    return;
+  }
+  out.line("CURRENT: valid solar exposure profile");
+  dump_solar_observations(out, "START", stored.starts, stored.start_count);
+  dump_solar_observations(out, "LIMIT", stored.limits, stored.limit_count);
+  dump_solar_observations(out, "RELEASE", stored.releases, stored.release_count);
+  uint32_t latest = 0;
+  for (uint8_t i = 0; i < stored.start_count; i++) latest = std::max(latest, stored.starts[i].epoch);
+  for (uint8_t i = 0; i < stored.limit_count; i++) latest = std::max(latest, stored.limits[i].epoch);
+  for (uint8_t i = 0; i < stored.release_count; i++) latest = std::max(latest, stored.releases[i].epoch);
+  out.linef("LATEST CAPTURE: %s", format_timestamp(latest).c_str());
+  out.line("UPDATE TRACKING: observation timestamps are stored inside this profile");
+  out.line("HISTORY POLICY: no separate metadata/history files; retained observations are the history");
 }
 
 void raw_hex_dump(SnapshotWriter &out, const String &path) {
@@ -280,6 +362,8 @@ void raw_hex_dump(SnapshotWriter &out, const String &path) {
     }
     out.line(line);
     offset += n;
+    // Keep the low-priority snapshot worker cooperative while formatting files.
+    vTaskDelay(1);
   }
 
   if (offset == 0 && out.ok()) out.line("  <empty>");
@@ -289,6 +373,39 @@ void raw_hex_dump(SnapshotWriter &out, const String &path) {
 void dump_current_value(SnapshotWriter &out, uint32_t key) {
   using namespace blind_settings;
   out.linef("SETTING: %s", key_name(key));
+
+  if (key == K_SOLAR_EXPOSURE_PROFILE) {
+    dump_solar_profile(out);
+    return;
+  }
+
+  if (key == K_SOLAR_CONTROL_MODE) {
+    std::string value;
+    if (!load_string(key, value, 32)) {
+      out.line("CURRENT: unable to decode solar control mode");
+      return;
+    }
+    const bool valid = value == "Solar Only" || value == "Solar + LDR" ||
+                       value == "LDR Only" || value == "Disabled";
+    out.linef("CURRENT: \"%s\"", value.c_str());
+    out.linef("VALIDATION: %s", valid ? "recognized control mode" : "UNRECOGNIZED CONTROL MODE");
+    return;
+  }
+
+  if (key == K_SOLAR_EXPOSURE_POSITION || key == K_SOLAR_WINTER_REDUCTION) {
+    float value = 0.0f;
+    if (!load(key, value)) {
+      out.line("CURRENT: unable to decode solar position setting");
+      return;
+    }
+    if (key == K_SOLAR_EXPOSURE_POSITION)
+      out.linef("CURRENT: %.1f %% (summer solar exposure tilt)", static_cast<double>(value));
+    else
+      out.linef("CURRENT: %.1f percentage points (winter tilt reduction)", static_cast<double>(value));
+    out.linef("VALIDATION: %s", value >= 0.0f && value <= (key == K_SOLAR_EXPOSURE_POSITION ? 100.0f : 50.0f)
+      ? "within configured range" : "OUTSIDE CONFIGURED RANGE");
+    return;
+  }
 
   if (is_string_key(key)) {
     std::string value;
@@ -380,6 +497,7 @@ void dump_history(SnapshotWriter &out, uint32_t key) {
     out.linef("    OLD: \"%s\"", old_value.c_str());
     out.linef("    NEW: \"%s\"", new_value.c_str());
     out.linef("    CHANGE: \"%s\" -> \"%s\"", old_value.c_str(), new_value.c_str());
+    vTaskDelay(1);
   }
 
   f.close();
@@ -477,8 +595,10 @@ void stream_dump(SnapshotWriter &out) {
     out.linef("KEY: 0x%08lX", static_cast<unsigned long>(key));
     out.linef("CFG FILE: %s", name.c_str());
     dump_current_value(out, key);
-    dump_metadata(out, key);
-    dump_history(out, key);
+    if (key != K_SOLAR_EXPOSURE_PROFILE) {
+      dump_metadata(out, key);
+      dump_history(out, key);
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
   cfg_dir.close();
@@ -549,25 +669,26 @@ bool start_snapshot_build() {
   return true;
 }
 
-const char *waiting_page() {
-  return "<!doctype html><html><head>"
-         "<meta charset=\"utf-8\">"
-         "<meta http-equiv=\"refresh\" content=\"1\">"
-         "<title>Storage Diagnostics</title></head><body><pre>"
-         "Storage diagnostics are waiting for motor travel to finish.\n"
-         "No filesystem work will run while the motor is moving.\n"
-         "This page will refresh automatically."
-         "</pre></body></html>";
+const std::string &waiting_page() {
+  static const std::string page = std::string("<!doctype html><html><head><meta charset=utf-8>") +
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1>"
+    "<title>Storage Diagnostics</title><style>" + SHARED_STYLE +
+    "</style></head><body><main><a class=nav href=\"/index\">&larr; Device pages</a>"
+    "<h1>Storage Diagnostics</h1><div class=card><strong>Waiting for motor travel to finish</strong>"
+    "<p>No filesystem work will run while the motor is moving. This page will refresh automatically.</p>"
+    "</div></main></body></html>";
+  return page;
 }
 
-const char *building_page() {
-  return "<!doctype html><html><head>"
-         "<meta charset=\"utf-8\">"
-         "<meta http-equiv=\"refresh\" content=\"1\">"
-         "<title>Storage Diagnostics</title></head><body><pre>"
-         "Storage diagnostics are being prepared in a low-priority background task.\n"
-         "This page will refresh automatically."
-         "</pre></body></html>";
+const std::string &building_page() {
+  static const std::string page = std::string("<!doctype html><html><head><meta charset=utf-8>") +
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\"><meta http-equiv=refresh content=1>"
+    "<title>Storage Diagnostics</title><style>" + SHARED_STYLE +
+    "</style></head><body><main><a class=nav href=\"/index\">&larr; Device pages</a>"
+    "<h1>Storage Diagnostics</h1><div class=card><strong>Preparing diagnostic report</strong>"
+    "<p>The snapshot is being built in a low-priority background task. This page will refresh automatically.</p>"
+    "</div></main></body></html>";
+  return page;
 }
 
 class StorageDiagnosticsHandler : public AsyncWebHandler {
@@ -575,19 +696,23 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
   bool canHandle(AsyncWebServerRequest *request) const override {
     if (request == nullptr || request->method() != HTTP_GET) return false;
     char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
-    return request->url_to(url_buffer) == DUMP_PATH;
+    const auto url = request->url_to(url_buffer);
+    return url == DUMP_PATH || url == DUMP_RAW_PATH;
   }
 
   void handleRequest(AsyncWebServerRequest *request) override {
     if (request == nullptr) return;
     httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
     if (raw_request == nullptr) return;
+    char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
+    const bool raw_output = request->url_to(url_buffer) == DUMP_RAW_PATH;
 
     if (motor_is_moving()) {
       httpd_resp_set_status(raw_request, "202 Accepted");
       httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
       httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
-      (void) httpd_resp_send(raw_request, waiting_page(), HTTPD_RESP_USE_STRLEN);
+      const auto &page = waiting_page();
+      (void) httpd_resp_send(raw_request, page.data(), page.size());
       return;
     }
 
@@ -596,7 +721,8 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
       httpd_resp_set_status(raw_request, "202 Accepted");
       httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
       httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
-      (void) httpd_resp_send(raw_request, building_page(), HTTPD_RESP_USE_STRLEN);
+      const auto &page = building_page();
+      (void) httpd_resp_send(raw_request, page.data(), page.size());
       if (started) ESP_LOGI(TAG, "Started nonblocking LittleFS diagnostics snapshot");
       return;
     }
@@ -614,7 +740,8 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
       httpd_resp_set_status(raw_request, "202 Accepted");
       httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
       httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
-      (void) httpd_resp_send(raw_request, waiting_page(), HTTPD_RESP_USE_STRLEN);
+      const auto &page = waiting_page();
+      (void) httpd_resp_send(raw_request, page.data(), page.size());
       return;
     }
 
@@ -628,16 +755,58 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
     }
 
     httpd_resp_set_status(raw_request, HTTPD_200);
-    httpd_resp_set_type(raw_request, "text/plain; charset=utf-8");
+    httpd_resp_set_type(raw_request, raw_output ? "text/plain; charset=utf-8" : "text/html; charset=utf-8");
     httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(raw_request, "Content-Disposition", "inline; filename=\"storage-diagnostics.txt\"");
+    if (raw_output)
+      httpd_resp_set_hdr(raw_request, "Content-Disposition", "inline; filename=\"storage-diagnostics.txt\"");
+
+    if (!raw_output) {
+      const std::string header = std::string("<!doctype html><html><head><meta charset=utf-8>") +
+        "<meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Storage Diagnostics</title><style>" +
+        SHARED_STYLE +
+        ".toolbar{display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 24px}.file-content{font-family:ui-monospace,SFMono-Regular,Consolas,"
+        "'Liberation Mono',monospace;font-size:13px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1220;"
+        "border:1px solid #374151;border-radius:12px;padding:18px;color:#d1d5db}</style></head><body><main>"
+        "<a class=nav href=\"/index\">&larr; Device pages</a><h1>Storage Diagnostics</h1>"
+        "<p>Read-only snapshot of settings and files retained in LittleFS.</p><div class=toolbar>"
+        "<a class=nav href=\"/littlefs.txt\">View raw text report</a></div><pre class=file-content>";
+      if (httpd_resp_send_chunk(raw_request, header.data(), header.size()) != ESP_OK) {
+        snapshot_serving.store(false, std::memory_order_release);
+        return;
+      }
+    }
 
     size_t offset = 0;
     while (offset < length) {
       wait_for_motor_idle();
       const size_t remaining = length - offset;
-      const size_t n = remaining > HTTP_CHUNK_SIZE ? HTTP_CHUNK_SIZE : remaining;
-      const esp_err_t err = httpd_resp_send_chunk(raw_request, data + offset, n);
+      // ESPHome's HTTP server task has a small stack. Keep HTML escaping in a
+      // deliberately small fixed buffer; the worst case is five output bytes
+      // per input byte ("&amp;").
+      const size_t limit = raw_output ? HTTP_CHUNK_SIZE : 128U;
+      const size_t n = remaining > limit ? limit : remaining;
+      esp_err_t err = ESP_OK;
+      if (raw_output) {
+        err = httpd_resp_send_chunk(raw_request, data + offset, n);
+      } else {
+        char escaped[768];
+        size_t written = 0;
+        for (size_t i = 0; i < n; i++) {
+          const char *replacement = nullptr;
+          switch (data[offset + i]) {
+            case '&': replacement = "&amp;"; break;
+            case '<': replacement = "&lt;"; break;
+            case '>': replacement = "&gt;"; break;
+            default: escaped[written++] = data[offset + i]; break;
+          }
+          if (replacement != nullptr) {
+            const size_t replacement_length = strlen(replacement);
+            memcpy(escaped + written, replacement, replacement_length);
+            written += replacement_length;
+          }
+        }
+        err = httpd_resp_send_chunk(raw_request, escaped, written);
+      }
       if (err != ESP_OK) {
         ESP_LOGW(TAG, "Storage diagnostics client disconnected: %s", esp_err_to_name(err));
         snapshot_serving.store(false, std::memory_order_release);
@@ -645,6 +814,11 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
       }
       offset += n;
       vTaskDelay(1);
+    }
+
+    if (!raw_output) {
+      static constexpr const char *FOOTER = "</pre></main></body></html>";
+      (void) httpd_resp_send_chunk(raw_request, FOOTER, HTTPD_RESP_USE_STRLEN);
     }
 
     (void) httpd_resp_send_chunk(raw_request, nullptr, 0);
@@ -658,7 +832,161 @@ class StorageDiagnosticsHandler : public AsyncWebHandler {
   }
 };
 
+class PsramPageWriter {
+ public:
+  PsramPageWriter(char *buffer, size_t capacity) : buffer_(buffer), capacity_(capacity) {
+    if (buffer_ != nullptr && capacity_ > 0) buffer_[0] = '\0';
+  }
+
+  bool write(const char *text) {
+    if (!ok_ || text == nullptr) return false;
+    const size_t length = strlen(text);
+    if (length >= capacity_ - used_) {
+      ok_ = false;
+      return false;
+    }
+    memcpy(buffer_ + used_, text, length);
+    used_ += length;
+    buffer_[used_] = '\0';
+    return true;
+  }
+
+  bool writef(const char *format, ...) {
+    if (!ok_ || format == nullptr) return false;
+    va_list args;
+    va_start(args, format);
+    const int written = vsnprintf(buffer_ + used_, capacity_ - used_, format, args);
+    va_end(args);
+    if (written < 0 || static_cast<size_t>(written) >= capacity_ - used_) {
+      ok_ = false;
+      return false;
+    }
+    used_ += static_cast<size_t>(written);
+    return true;
+  }
+
+  bool ok() const { return ok_; }
+  const char *data() const { return buffer_; }
+  size_t size() const { return used_; }
+
+ private:
+  char *buffer_{nullptr};
+  size_t capacity_{0};
+  size_t used_{0};
+  bool ok_{true};
+};
+
+void append_solar_table(PsramPageWriter &html, const char *title,
+                         solar_exposure::Boundary boundary) {
+  const auto *values = solar_exposure::items(boundary);
+  const uint8_t used = solar_exposure::count(boundary);
+  html.writef("<section><h2>%s observations <span>%u / %u</span></h2>",
+              title, unsigned(used), unsigned(solar_exposure::MAX_OBSERVATIONS));
+  if (used == 0) {
+    html.write("<p class=empty>No observations captured.</p></section>");
+    return;
+  }
+  html.write("<table><thead><tr><th>#</th><th>Captured</th><th>Day of year</th>"
+             "<th>Local time</th><th>Azimuth</th><th>Elevation</th><th>Gap to next</th></tr></thead><tbody>");
+  for (uint8_t i = 0; i < used; i++) {
+    char captured[32] = "Unknown";
+    if (values[i].epoch != 0) {
+      const time_t epoch = time_t(values[i].epoch);
+      struct tm local{};
+      localtime_r(&epoch, &local);
+      strftime(captured, sizeof(captured), "%Y-%m-%d %H:%M", &local);
+    }
+    const int gap = used == 1 ? 366 : solar_exposure::seasonal_distance(
+      values[i].day_of_year, values[(i + 1) % used].day_of_year);
+    html.writef(
+      "<tr><td>%u</td><td>%s</td><td>%u</td><td>%02u:%02u</td>"
+      "<td>%.2f&deg;</td><td>%.2f&deg;</td><td>%d days</td></tr>",
+      unsigned(i + 1), captured, unsigned(values[i].day_of_year),
+      unsigned(values[i].local_minute / 60), unsigned(values[i].local_minute % 60),
+      values[i].azimuth, values[i].elevation, gap);
+  }
+  html.write("</tbody></table></section>");
+}
+
+class SolarExposureHandler : public AsyncWebHandler {
+ public:
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    if (request == nullptr || request->method() != HTTP_GET) return false;
+    char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->url_to(url_buffer) == SOLAR_PATH;
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) override {
+    if (request == nullptr) return;
+    httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
+    if (raw_request == nullptr) return;
+    if (!solar_exposure::loaded) solar_exposure::load();
+    char *page_buffer = static_cast<char *>(
+      heap_caps_malloc(SOLAR_PAGE_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (page_buffer == nullptr) {
+      ESP_LOGE(TAG, "Could not allocate solar report PSRAM buffer");
+      httpd_resp_send_err(raw_request, HTTPD_500_INTERNAL_SERVER_ERROR, "Solar report memory unavailable");
+      return;
+    }
+    PsramPageWriter html(page_buffer, SOLAR_PAGE_CAPACITY);
+    html.write("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+               "<title>Solar Exposure Observations</title><style>");
+    html.write(SHARED_STYLE);
+    html.write("h2 span{font-size:.65em;color:#93c5fd;font-weight:500}</style>"
+               "</head><body><main><a class=nav href=\"/index\">&larr; Device pages</a><h1>Solar Exposure Observations</h1>"
+               "<p>Read-only seasonal record. “Gap to next” makes underrepresented parts of the year visible. Dense records are pruned automatically only after capacity is reached.</p>");
+    append_solar_table(html, "Exposure begin", solar_exposure::Boundary::START);
+    append_solar_table(html, "Tilt limit", solar_exposure::Boundary::LIMIT);
+    append_solar_table(html, "Exposure release", solar_exposure::Boundary::RELEASE);
+    html.write("</main></body></html>");
+    if (!html.ok()) {
+      heap_caps_free(page_buffer);
+      ESP_LOGE(TAG, "Solar report exceeded PSRAM page buffer");
+      httpd_resp_send_err(raw_request, HTTPD_500_INTERNAL_SERVER_ERROR, "Solar report exceeded buffer");
+      return;
+    }
+    httpd_resp_set_status(raw_request, HTTPD_200);
+    httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
+    (void) httpd_resp_send(raw_request, html.data(), html.size());
+    heap_caps_free(page_buffer);
+  }
+};
+
+class DeviceIndexHandler : public AsyncWebHandler {
+ public:
+  bool canHandle(AsyncWebServerRequest *request) const override {
+    if (request == nullptr || request->method() != HTTP_GET) return false;
+    char url_buffer[AsyncWebServerRequest::URL_BUF_SIZE];
+    return request->url_to(url_buffer) == INDEX_PATH;
+  }
+
+  void handleRequest(AsyncWebServerRequest *request) override {
+    if (request == nullptr) return;
+    httpd_req_t *raw_request = static_cast<httpd_req_t *>(*request);
+    if (raw_request == nullptr) return;
+    const std::string page = std::string(
+      "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+      "<title>Blind Controller Pages</title><style>") + SHARED_STYLE +
+      ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:28px}"
+      ".grid a{display:block;text-decoration:none;color:#e5e7eb;background:#1f2937;border:1px solid #374151;border-radius:12px;padding:20px}"
+      ".grid a:hover{border-color:#60a5fa;background:#263449}.grid strong{display:block;color:#bfdbfe;font-size:1.1rem;margin-bottom:7px}"
+      ".grid span{color:#9ca3af;line-height:1.4}</style></head>"
+      "<body><main><h1>Blind Controller Pages</h1><p>Local pages exposed by this controller.</p><div class=grid>"
+      "<a href=\"/\"><strong>ESPHome Controls</strong><span>Entities, settings, live states, and device controls.</span></a>"
+      "<a href=\"/solar-exposure\"><strong>Solar Exposure Records</strong><span>Read-only captured start/end observations and seasonal coverage gaps.</span></a>"
+      "<a href=\"/littlefs\"><strong>Storage Diagnostics</strong><span>Read-only persistent settings and LittleFS diagnostic snapshot.</span></a>"
+      "</div></main></body></html>";
+    httpd_resp_set_status(raw_request, HTTPD_200);
+    httpd_resp_set_type(raw_request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(raw_request, "Cache-Control", "no-store");
+    (void) httpd_resp_send(raw_request, page.data(), page.size());
+  }
+};
+
 StorageDiagnosticsHandler handler;
+SolarExposureHandler solar_handler;
+DeviceIndexHandler index_handler;
 bool handler_registered = false;
 
 }  // namespace
@@ -677,8 +1005,12 @@ bool register_handler() {
   }
 
   base->add_handler(&handler);
+  base->add_handler(&solar_handler);
+  base->add_handler(&index_handler);
   handler_registered = true;
   ESP_LOGI(TAG, "Registered storage diagnostics endpoint at %s", DUMP_PATH);
+  ESP_LOGI(TAG, "Registered solar exposure report at %s", SOLAR_PATH);
+  ESP_LOGI(TAG, "Registered device page directory at %s", INDEX_PATH);
   return true;
 }
 
